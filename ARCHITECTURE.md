@@ -1,0 +1,384 @@
+# PBIX Documentation CLI — locked architecture baseline
+
+Status: **approved and locked**  
+Baseline version: **1.1**  
+Change rule: this document changes only after explicit user approval.
+
+## 1. Product contract
+
+The program is a local Python CLI application developed in PyCharm.
+
+```text
+Input:  exactly one Power BI report in .pbix format
+Output: exactly one human-readable .txt documentation file
+```
+
+Runtime requirements:
+
+- local processing only;
+- no Power BI Service or Fabric API;
+- no external LLM;
+- no network requirement;
+- no mandatory Power BI Desktop;
+- no execution of DAX, M, SQL, custom visual code, or user scripts;
+- no persistent extraction folders, JSON dumps, CSV files, or table rows;
+- local temporary files are allowed and removed after processing.
+
+## 2. Processing pipeline
+
+```text
+CLI / Controller
+    -> Preflight Validator
+    -> PBIX Container Reader
+       -> Report Format Detector
+          -> PBIR Parser
+          -> Legacy Layout Parser
+       -> PBIXRay Semantic Model Adapter
+          -> Optional Data Profiler
+    -> Normalizer
+    -> Field Resolver
+    -> Value Exposure Policy
+    -> Validation Layer
+    -> Deterministic TXT Renderer
+    -> Atomic Writer
+```
+
+The TXT renderer receives only the normalized and policy-safe domain model. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, or unsanitized saved values.
+
+## 3. Input handling
+
+The preflight layer verifies:
+
+- `.pbix` extension;
+- existence and readability;
+- output path differs from input;
+- supported container signature;
+- duplicate or suspicious archive members;
+- configured size and decompression limits;
+- protected, encrypted, corrupt, or unsupported input state.
+
+The container is opened read-only. Member paths are normalized for separators and comparison while original names are retained for evidence paths.
+
+## 4. Report adapters
+
+### 4.1 PBIR adapter
+
+The PBIR adapter reads versioned report, page, visual, bookmark, and mobile-layout JSON. Parsing is selected by `$schema` and `version.json`. Unknown schema versions produce a partial result rather than an assumed successful parse.
+
+### 4.2 Legacy Layout adapter
+
+The Legacy adapter reads `Report/Layout`, including UTF-16LE content and recursively encoded JSON strings. Semantic expressions are interpreted by an AST-aware parser with source-alias resolution. A generic JSON walker is only a discovery fallback and its findings have reduced confidence until resolved.
+
+Both adapters return the same domain entities: `Report`, `Page`, `Visual`, `FieldUsage`, `Filter`, `Action`, and `ExtractionIssue`.
+
+Bookmarks and navigation are mandatory extraction targets. The adapters preserve:
+
+- bookmark ID, display name, order, and group;
+- the page associated with the bookmark;
+- saved-state scope (`data`, `display`, `current page`, or their available equivalents);
+- affected visuals without exposing saved data literals;
+- buttons, shapes, images, and navigators that activate the bookmark;
+- page navigation, bookmark navigation, drillthrough, and report-tooltip targets.
+
+## 5. Semantic model adapter
+
+PBIXRay is isolated behind `SemanticModelAdapter`. Its version is pinned and covered by adapter contract tests.
+
+The adapter may expose:
+
+- tables and columns;
+- data types and model properties;
+- measures and DAX;
+- calculated columns and tables;
+- hierarchies;
+- relationships;
+- Power Query metadata;
+- RLS and OLS definitions;
+- connection metadata;
+- model status.
+
+Supported model statuses:
+
+```text
+EMBEDDED
+THIN_REPORT
+LIVE_CONNECTION
+NO_MODEL
+PARTIAL
+FAILED
+```
+
+A missing embedded model must not prevent report-layout documentation.
+
+## 6. Data profiler
+
+Data profiling is a separate, optional stage. It may read eligible embedded columns to calculate display-safe examples but must never persist or render raw rows.
+
+Default policy:
+
+| Column kind | Output examples |
+|---|---|
+| Categorical text | Up to five most frequent values |
+| Boolean | Up to two values |
+| Low-cardinality numeric category | Up to five values |
+| Continuous numeric | Hidden |
+| Date/time | Hidden by default |
+| ID, key, GUID, account, phone, email | Hidden |
+| Measure | Not evaluated |
+| Remote/thin model column | Not available locally |
+
+Exact top values are calculated only for eligible columns. Large eligible columns are processed in bounded chunks. Frequency counts are not rendered by default. Ties are ordered deterministically.
+
+## 7. Value exposure policy
+
+`ValueExposurePolicy` is the sole authority for values in the normalized output model.
+
+Default behavior:
+
+```text
+Raw table rows:                  never output
+Measure results:                never calculated or output
+Saved filter/slicer literals:   hidden
+Continuous numeric values:      hidden
+Identifiers and keys:           hidden
+Categorical examples:           maximum five
+Connection secrets:             removed
+DAX definitions:                included as code
+Power Query definitions:        included only after sanitization
+```
+
+Report object counts, coordinates, model cardinality, technical versions, and other metadata are not treated as business fact values.
+
+Raw filter values and disallowed column values should be discarded before the normalized model reaches the renderer. The renderer displays placeholders such as `<VALUES HIDDEN>` or `<NUMERIC VALUES NOT SHOWN>`.
+
+## 8. Normalized domain model
+
+```text
+DocumentationModel
+├── FileInfo
+├── ExtractionSummary
+├── Report
+│   ├── report_filters[]
+│   ├── bookmarks[]
+│   ├── navigation_edges[]
+│   └── pages[]
+│       ├── page_filters[]
+│       ├── field_usages[]
+│       └── visuals[]
+│           ├── layout
+│           ├── fields[]
+│           ├── filters[]
+│           └── actions[]
+├── SemanticModel
+│   ├── tables[]
+│   │   └── columns[]
+│   │       └── safe profile
+│   ├── measures[]
+│   ├── relationships[]
+│   ├── hierarchies[]
+│   ├── power_query[]
+│   ├── rls[]
+│   └── ols[]
+└── ExtractionIssue[]
+```
+
+Every field use retains its report scope, usage type, page/visual ID, role, aggregation, evidence path, and resolution status.
+
+## 9. Bookmarks and navigation graph
+
+The TXT must make page relationships understandable in both directions.
+
+For every bookmark, output:
+
+- name, ID, group, and order;
+- associated page;
+- saved-state scope;
+- affected visual IDs or an aggregate description;
+- every report element that activates the bookmark;
+- whether an entry point was found in report metadata.
+
+For every navigation edge, output:
+
+```text
+Source page -> source visual -> action type -> target object -> related target page
+```
+
+Supported edge categories include:
+
+- page navigation;
+- bookmark navigation;
+- bookmark navigator;
+- page navigator;
+- drillthrough;
+- report-page tooltip;
+- back action when its target is available;
+- web URL as an external target without treating it as a report page.
+
+The processor builds a directed navigation graph and derives outgoing and incoming connections for each page. It reports missing bookmark/page targets, bookmarks with no discovered report entry point, links to hidden pages, and navigation cycles as diagnostics. A bookmark without a discovered button is not automatically invalid because it can still be used from the bookmark pane or other Power BI state.
+
+Saved slicer/filter values inside bookmarks remain hidden under `ValueExposurePolicy`.
+
+## 10. RLS and OLS output — formal placeholder until the first production run
+
+The RLS/OLS section is mandatory in the TXT, but detailed corporate-security interpretation is provisional until the analyzer is tested against a real production PBIX. The first implementation must not claim complete RLS/OLS coverage.
+
+Minimum placeholder output:
+
+- whether RLS metadata was found;
+- whether OLS metadata was found;
+- role names, affected model objects, and locally readable expressions when available;
+- model availability (`EMBEDDED`, `DIRECTQUERY`, `THIN/LIVE`, or unknown);
+- explicit `PROVISIONAL` status;
+- no login, UPN, account, or role-member values.
+
+Detailed dynamic-RLS topology analysis below is a target capability, not an accepted production contract before the first real PBIX run. Its exact fields, classifications, and diagnostics will be revised from observed corporate metadata.
+
+RLS documentation includes locally available role definitions, affected tables, DAX filter expressions, state, and metadata permission. It does not claim which real users are assigned to roles in Power BI Service.
+
+The analyzer must distinguish at least two RLS patterns:
+
+```text
+STATIC_ROLE_FILTER
+DYNAMIC_IDENTITY_FILTER
+DYNAMIC_TABLE_MAPPING
+UNKNOWN
+```
+
+For dynamic table mapping, the TXT additionally documents:
+
+- the security/access table;
+- identity columns such as login, UPN, or account name;
+- access-scope columns such as region, department, company, or entity key;
+- identity functions found in DAX, such as `USERPRINCIPALNAME()` or `USERNAME()`;
+- other supported identity functions found in DAX, including `USEROBJECTID()` and `CUSTOMDATA()` when present;
+- relationships through which the security filter reaches dimensions and fact tables;
+- whether bidirectional security propagation is declared in model metadata;
+- any ambiguity, disconnected path, or inactive relationship.
+
+Login/UPN values from the mapping table are identifiers and must not be printed as examples. Aggregate metadata such as column cardinality may be shown under the normal value policy.
+
+When mapping rows are locally embedded and security profiling is enabled, the analyzer may calculate non-identifying quality summaries without retaining identities:
+
+- blank identity count;
+- duplicate identity/scope mapping count;
+- identity format classification (`UPN-like`, `DOMAIN\\login`, object-ID-like, or mixed);
+- orphaned access keys that do not resolve to the secured dimension;
+- inactive, ambiguous, or disconnected security paths.
+
+These checks never print an actual login. A likely mismatch between the identity function and the detected format is a warning, not a claim about effective access.
+
+Availability depends on the model mode:
+
+- embedded Import model: role definitions, topology, and allowed aggregate quality checks can be available;
+- DirectQuery/composite model: definitions and topology can be available, while source rows and login quality statistics are normally unavailable without executing the source query, which this application does not do;
+- thin/live report: the remote model's RLS/OLS definitions and mapping table can be absent from the PBIX, so the section is marked `NOT_AVAILABLE` or `PARTIAL`.
+
+Power BI Service can still assign users or groups to the generic dynamic role. Those current service-side assignments are not reliably available from a local PBIX. The local document therefore describes how an authenticated identity would be mapped, not who currently has access in the service.
+
+OLS documentation includes role, protected table or column, object scope, and permission. It documents model definitions, not the effective permissions of a particular signed-in user.
+
+OLS is separate from a login mapping table: native OLS hides tables or columns through role object permissions. A mapping table that limits rows is RLS even when it contains columns named `Role`, `Profile`, or `AccessLevel`. If no native OLS metadata exists, the OLS section states that no OLS definitions were found.
+
+If the PBIX does not contain the required model metadata, the section is marked `NOT_AVAILABLE` or `PARTIAL`.
+
+Until the production run, any detected pattern or propagation path is labeled `PROVISIONAL` and does not affect overall extraction success unless the underlying model reader itself fails.
+
+## 11. Unresolved references
+
+An unresolved reference is a field-like report reference that was discovered but could not be mapped with sufficient confidence to a semantic-model object.
+
+Typical causes:
+
+- thin/live report without a local model;
+- custom visual metadata with a proprietary binding shape;
+- field parameter or dynamic expression not fully understood;
+- source alias that cannot be reconstructed;
+- model object missing or renamed;
+- a newer unsupported PBIR expression version;
+- partial model extraction.
+
+Unresolved does not automatically mean that the report is broken. Each entry contains the discovered name, location, reason, and evidence path.
+
+## 12. Diagnostics
+
+Diagnostics describe extraction quality, not Power BI business results. They include:
+
+- component status (`OK`, `PARTIAL`, `NOT_AVAILABLE`, `FAILED`);
+- counts of pages, visuals, field references, and resolved references;
+- detected formats and versions;
+- skipped or unsupported structures;
+- bookmark groups, navigation edges, missing targets, and hidden-page transitions;
+- detected RLS pattern and security propagation paths;
+- redacted value categories;
+- profiling omissions;
+- nonfatal parser/model warnings;
+- critical read or write errors;
+- application and dependency versions.
+
+Diagnostics are printed to the console and included in the final TXT. No permanent log file is created by default.
+
+## 13. Output structure
+
+```text
+1. File and generation information
+2. Extraction status
+3. Report summary
+4. Page list
+5. Bookmarks and navigation graph
+5+. One section per page
+    - page properties
+    - visual registry
+    - direct visual fields
+    - contextual fields
+    - filters
+    - navigation
+    - warnings
+N. Semantic model
+    - tables
+    - columns and safe examples
+    - measures and DAX
+    - calculated objects
+    - relationships
+N+1. Power Query and sources
+N+2. RLS and OLS
+N+3. Unresolved references
+N+4. Diagnostics
+```
+
+The file is written as UTF-8 with BOM and Windows CRLF line endings. The writer uses a same-directory temporary file followed by atomic replacement where the filesystem supports it.
+
+## 14. Exit behavior
+
+```text
+0 = complete successful extraction
+2 = usable partial documentation was produced
+1 = input could not be read
+3 = output could not be written
+```
+
+Partial output is preferred whenever at least one meaningful subsystem succeeded.
+
+## 15. Project layout
+
+```text
+src/pbix_doc/
+├── __main__.py
+├── cli.py
+├── application.py
+├── config.py
+├── errors.py
+├── container/
+├── report/
+├── model/
+├── domain/
+├── processing/
+└── output/
+
+tests/
+├── unit/
+├── integration/
+├── fixtures/
+└── golden/
+```
+
+The production dependency baseline is a pinned PBIXRay release plus `tabulate`. Tests use `pytest`, coverage, static analysis, and golden TXT comparisons.
