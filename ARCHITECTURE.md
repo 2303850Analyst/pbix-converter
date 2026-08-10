@@ -1,7 +1,7 @@
 # PBIX Documentation CLI — locked architecture baseline
 
 Status: **approved and locked**
-Baseline version: **1.3**
+Baseline version: **2.0**
 Change rule: this document changes only after explicit user approval.
 
 ## 1. Product contract
@@ -10,7 +10,7 @@ The program is a Python application developed in PyCharm and executed inside a c
 
 ```text
 Input:  exactly one Power BI report in .pbix format
-Output: exactly one human-readable .txt documentation file
+Output: exactly one human-readable .docx documentation file
 ```
 
 Runtime requirements:
@@ -37,9 +37,9 @@ The application:
 - does not invoke Git, package managers, browsers, Yandex Disk, or other sync clients at runtime;
 - installs process-wide Python audit guards at the production entry point, before GUI, controller, parser, or third-party analysis imports;
 - treats every runtime-policy violation as a fatal error that cannot be downgraded to partial extraction;
-- produces no permanent logs and does not include the absolute source path in the TXT;
+- produces no permanent logs and does not include the absolute source path in the DOCX;
 - creates its extraction workspace beside the user-selected output, removes it normally, and removes abandoned application-owned workspaces on a later run;
-- keeps the atomic output temporary file beside the final TXT.
+- keeps the atomic output temporary file beside the final DOCX.
 
 `NetworkEgressGuard` rejects Python socket creation, connection, DNS/service resolution, datagram sending, and `urllib` requests. Its purpose is to make accidental application or dependency network access fail closed. `ExternalProcessGuard` is a separate policy that rejects process-launch audit events so application code or a dependency cannot delegate transmission to another executable. Both violations use a dedicated fatal exit path.
 
@@ -64,11 +64,14 @@ CLI / Controller
     -> Field Resolver
     -> Value Exposure Policy
     -> Validation Layer
-    -> Deterministic TXT Renderer
+    -> Document Projector
+    -> Safe Document Model
+    -> Deterministic DOCX Renderer
+    -> OOXML Validator
     -> Atomic Writer
 ```
 
-The TXT renderer receives only the normalized and policy-safe domain model. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, or unsanitized saved values.
+`DocumentProjector` receives the normalized and policy-safe domain model and derives user-facing KPI lineage, same-name comparison groups, explicit context evidence, bookmark cards, navigation indexes, and document-local references. The DOCX renderer receives only `SafeDocumentModel`. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, the normalized PBIX model, or unsanitized saved values.
 
 ## 3. Input handling
 
@@ -176,7 +179,7 @@ Power Query definitions:        included only after sanitization
 
 Report object counts, coordinates, model cardinality, technical versions, and other metadata are not treated as business fact values.
 
-Raw filter values and disallowed column values should be discarded before the normalized model reaches the renderer. The renderer displays placeholders such as `<VALUES HIDDEN>` or `<NUMERIC VALUES NOT SHOWN>`.
+Raw filter values and disallowed column values should be discarded before the normalized model reaches the projector. The document model contains placeholders such as `<VALUES HIDDEN>` or `<NUMERIC VALUES NOT SHOWN>`.
 
 ## 8. Normalized domain model
 
@@ -211,9 +214,34 @@ DocumentationModel
 
 Every field use retains its report scope, usage type, page/visual ID, role, aggregation, evidence path, and resolution status.
 
+### 8.1 Document projection and evidence taxonomy
+
+`DocumentProjector` is a deterministic interpretation boundary. It may derive only facts supported by normalized metadata and produces:
+
+- short stable document-local IDs for pages, visuals, KPI definitions, bookmarks, and navigation edges;
+- symbolic KPI dependency chains without evaluating DAX;
+- usage locations and explicit report/page/visual/bookmark context evidence;
+- groups of identical visible titles used with different semantic objects or contexts;
+- incoming and outgoing navigation indexes and direct user journeys;
+- `PARTIAL`, `UNRESOLVED`, and overflow markers.
+
+The comparison taxonomy is fixed:
+
+```text
+DEFINITION_DIFFERENCE       different semantic source, DAX, dependency, role, or aggregation
+POTENTIAL_CONTEXT_INFLUENCE different discovered report/page/visual/bookmark context
+UNRESOLVED                  available metadata is insufficient
+```
+
+These statuses describe structural metadata. They never assert that two evaluated values are different or that a structural difference is the proven cause of a business result.
+
+DAX is metadata code explicitly permitted by `ValueExposurePolicy`. A token-aware sanitizer removes comments and string literals while preserving structural identifiers, operators, functions, and numeric constants. Dependencies are marked with extraction status. If tokenization is malformed or safe rendering cannot be established, the formula is omitted and marked `PARTIAL`.
+
+Document budgets limit DAX length, dependency count, table rows, visual count, and total OOXML package size. Any truncation is deterministic and rendered with an explicit overflow marker.
+
 ## 9. Bookmarks and navigation graph
 
-The TXT must make page relationships understandable in both directions.
+The DOCX must make page relationships understandable in both directions.
 
 For every bookmark, output:
 
@@ -247,7 +275,7 @@ Saved slicer/filter values inside bookmarks remain hidden under `ValueExposurePo
 
 ## 10. RLS and OLS output — formal placeholder until the first production run
 
-The RLS/OLS section is mandatory in the TXT, but detailed corporate-security interpretation is provisional until the analyzer is tested against a real production PBIX. The first implementation must not claim complete RLS/OLS coverage.
+The RLS/OLS section is mandatory in the DOCX, but detailed corporate-security interpretation is provisional until the analyzer is tested against a real production PBIX. The first implementation must not claim complete RLS/OLS coverage.
 
 Minimum placeholder output:
 
@@ -271,7 +299,7 @@ DYNAMIC_TABLE_MAPPING
 UNKNOWN
 ```
 
-For dynamic table mapping, the TXT additionally documents:
+For dynamic table mapping, the DOCX additionally documents:
 
 - the security/access table;
 - identity columns such as login, UPN, or account name;
@@ -342,39 +370,30 @@ Diagnostics describe extraction quality, not Power BI business results. They inc
 - critical read or write errors;
 - application and dependency versions.
 
-Diagnostics are printed to the console and included in the final TXT. No permanent log file is created by default. GUI and CLI errors contain a concise message without a traceback. Evidence paths in the TXT refer only to internal PBIX members, not to absolute Windows paths.
+Diagnostics are printed to the console and included in the final DOCX. No permanent log file is created by default. GUI and CLI errors contain a concise message without a traceback. Evidence paths in the DOCX refer only to internal PBIX members, not to absolute Windows paths.
 
-## 13. Output structure
+## 13. DOCX output contract
 
 ```text
-1. File and generation information
-2. Extraction status
-3. Report summary
-4. Page list
-5. Bookmarks and navigation graph
-5+. One section per page
-    - page properties
-    - visual registry
-    - direct visual fields
-    - contextual fields
-    - filters
-    - navigation
-    - warnings
-N. Semantic model
-    - tables
-    - columns and safe examples
-    - measures and DAX
-    - calculated objects
-    - relationships
-N+1. Power Query and sources
-N+2. RLS and OLS
-N+3. Unresolved references
-N+4. Diagnostics
+1. Report passport, extraction status, and terminology
+2. Same visible name — possible structural or context differences
+3. KPI and calculation catalog
+4. Page and visual guide
+5. Buttons, bookmarks, navigators, tooltip, and drillthrough
+6. Direct user journeys
+7. Semantic model and relationships
+8. Power Query and sources
+9. RLS and OLS
+10. Unresolved references, diagnostics, and technical appendix
 ```
 
-The file is written as UTF-8 with BOM and Windows CRLF line endings. The writer uses a same-directory temporary file followed by atomic replacement where the filesystem supports it.
+The DOCX uses the `compact_reference_guide` design preset with an Arial 11 pt body override, built-in `Heading 1`–`Heading 3`, a monospaced code style for DAX, a single-column portrait layout, and native Word tables. Tables have explicit fixed geometry, repeated header rows, no merged or nested cells, and at most five columns. Color is never the sole carrier of meaning. Critical navigation does not depend on Word hyperlinks surviving Confluence import.
+
+The package is macro-free OOXML. Before publication, `OOXMLValidator` rejects macros, OLE/ActiveX or embedded objects, remote templates, external relationships, external hyperlinks, automatic fields, unsafe member paths, duplicate members, invalid XML, disallowed control characters, and package or part size violations. The writer uses a same-directory temporary file, validates it, fsyncs it, and performs atomic replacement where the filesystem supports it.
 
 The file-information section contains the PBIX filename, size, modification time, and SHA-256. It does not contain the absolute input path.
+
+The DOCX is intended for manual import through the built-in Word import in Atlassian Confluence Data Center. Exact fonts, widths, page breaks, and internal Word navigation may be restyled by Confluence; the heading hierarchy, visible document-local IDs, native tables, and explicit textual destinations are the durable contract.
 
 ## 14. Exit behavior
 
@@ -402,6 +421,8 @@ src/pbix_doc/
 ├── report.py
 ├── semantic.py
 ├── domain.py
+├── projector.py
+├── ooxml.py
 └── renderer.py
 
 tests/
@@ -413,4 +434,4 @@ scripts/
 └── run_pbix_doc.ps1
 ```
 
-The direct production dependency is pinned in `pyproject.toml`; the complete tested transitive set and permitted wheel hashes are pinned in `requirements.lock` for Windows x64 and CPython 3.11–3.13. The build backend is separately pinned by version and hash in `requirements-build.lock`. The release builder downloads only hash-matching binary wheels on a separate build machine, builds the application wheel in an isolated environment, and emits `SHA256SUMS`. VDI installation verifies the manifest and uses pip with `--no-index` and the bundled wheelhouse.
+Direct production dependencies are pinned in `pyproject.toml`; the complete tested transitive set and permitted wheel hashes are pinned in `requirements.lock` for Windows x64 and CPython 3.11–3.13. The build backend is separately pinned by version and hash in `requirements-build.lock`. The release builder downloads only hash-matching binary wheels on a separate build machine, builds the application wheel in an isolated environment, and emits `SHA256SUMS`. VDI installation verifies the manifest and uses pip with `--no-index` and the bundled wheelhouse.

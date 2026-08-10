@@ -7,7 +7,7 @@ from tkinter import Tk, filedialog, messagebox
 from tkinter import ttk
 
 from .pipeline import MAX_EXAMPLE_VALUES, Options, generate_documentation
-from .renderer import overall_status
+from .projector import overall_status
 from .runtime import RuntimePolicyViolation
 
 
@@ -31,9 +31,9 @@ def launch_gui(example_limit: int = 5) -> int:
         parent=root,
         title="Куда сохранить документацию",
         initialdir=input_path.parent,
-        initialfile=f"{input_path.stem}_documentation.txt",
-        defaultextension=".txt",
-        filetypes=(("Text document", "*.txt"),),
+        initialfile=f"{input_path.stem}_documentation.docx",
+        defaultextension=".docx",
+        filetypes=(("Word document", "*.docx"),),
     )
     if not output_name:
         root.destroy()

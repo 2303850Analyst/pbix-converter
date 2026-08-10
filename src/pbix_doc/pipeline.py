@@ -85,13 +85,14 @@ def generate_documentation(
     progress: ProgressCallback | None = None,
 ) -> DocumentationModel:
     from .renderer import atomic_write, render_document
+    from .projector import project_document
 
     input_path = input_path.resolve()
     output_path = output_path.resolve()
     if input_path == output_path:
         raise ValueError("Входной и выходной пути не должны совпадать")
-    if output_path.suffix.casefold() != ".txt":
-        raise ValueError("Выходной файл должен иметь расширение .txt")
+    if output_path.suffix.casefold() != ".docx":
+        raise ValueError("Выходной файл должен иметь расширение .docx")
     if not output_path.parent.is_dir():
         raise FileNotFoundError(output_path.parent)
     model = analyze_pbix(
@@ -101,8 +102,8 @@ def generate_documentation(
         workspace_parent=output_path.parent,
     )
     if progress:
-        progress("Запись TXT")
-    atomic_write(output_path, render_document(model))
+        progress("Формирование DOCX")
+    atomic_write(output_path, render_document(project_document(model)))
     if progress:
         progress("Готово")
     return model

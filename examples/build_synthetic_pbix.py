@@ -140,6 +140,7 @@ def bookmark(name: str, display_name: str, page_name: str, visual_names: list[st
 def parts() -> dict[str, Any]:
     year_filter = filter_definition("ReportFilter_Year", "Calendar", "Year", "2025", "2026")
     region_filter = filter_definition("VisualFilter_Region", "Sales", "Region", "Центр", "Север")
+    category_filter = filter_definition("PageFilter_Category", "Product", "Category", "Техника", "Дом")
     overview_visuals = {
         "card_revenue": visual(
             "card_revenue",
@@ -185,6 +186,13 @@ def parts() -> dict[str, Any]:
         "intro_text": visual("intro_text", "Синтетический демонстрационный отчёт", "textbox", (660, 270, 5, 570, 80)),
     }
     details_visuals = {
+        "card_revenue_context": visual(
+            "card_revenue_context",
+            "Выручка",
+            "card",
+            (900, 500, 4, 330, 110),
+            {"Values": [projection("Sum(Sales.Amount)", aggregation("Sales", "Amount"))]},
+        ),
         "matrix_sales": visual(
             "matrix_sales",
             "Матрица продаж",
@@ -248,6 +256,7 @@ def parts() -> dict[str, Any]:
                 }
             },
             "filterConfig": {"filters": [year_filter]},
+            "displayName": "Синтетический отчёт по продажам",
             "annotations": [{"name": "fixture", "value": "synthetic; no embedded semantic model"}],
         },
         f"{ROOT}/pages/pages.json": {
@@ -256,7 +265,10 @@ def parts() -> dict[str, Any]:
             "activePageName": "overview",
         },
         f"{ROOT}/pages/overview/page.json": page("overview", "Обзор"),
-        f"{ROOT}/pages/details/page.json": page("details", "Детали"),
+        f"{ROOT}/pages/details/page.json": {
+            **page("details", "Детали"),
+            "filterConfig": {"filters": [category_filter]},
+        },
         f"{ROOT}/pages/tooltip_sales/page.json": page("tooltip_sales", "Tooltip: продажи", page_type="Tooltip", hidden=True),
         f"{ROOT}/bookmarks/bookmarks.json": {
             "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/bookmarksMetadata/1.1.0/schema.json",

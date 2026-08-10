@@ -1,462 +1,67 @@
 from __future__ import annotations
 
-import codecs
 import os
-import re
 import tempfile
+import zipfile
+from io import BytesIO
 from pathlib import Path
-from typing import Any, Iterable
 
-from .domain import DocumentationModel
+from docx import Document
+from docx.document import Document as DocumentObject
+from docx.enum.section import WD_SECTION
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt, RGBColor
+
+from .ooxml import validate_docx
+from .projector import (
+    CodeBlock,
+    HeadingBlock,
+    ListBlock,
+    ParagraphBlock,
+    SafeDocumentModel,
+    TableBlock,
+    clean_text,
+)
 from .runtime import atomic_temp_prefix, cleanup_stale_artifacts
 
 
-LINE = "=" * 110
-SUBLINE = "-" * 110
+CONTENT_WIDTH_DXA = 9_360
+BLUE = "2E5E8C"
+DARK_BLUE = "17365D"
+LIGHT_BLUE = "E8EEF5"
+LIGHT_GRAY = "F2F4F7"
+MUTED = "5F6B76"
+RED = "9B1C1C"
+GOLD = "7A5A00"
 
 
-def render_document(model: DocumentationModel) -> str:
-    report = model.report
-    semantic = model.semantic_model
-    visuals = [visual for page in report.pages for visual in page.visuals]
-    fields = [field for visual in visuals for field in visual.fields]
-    unresolved = [field for field in fields if field.status != "RESOLVED"]
-    overall = overall_status(model)
-    page_by_id = {page.id: page for page in report.pages}
-
-    lines = [LINE, "ДОКУМЕНТАЦИЯ POWER BI", LINE]
-    add_section(lines, "1", "Сведения о файле")
-    lines.extend(
-        [
-            f"Имя: {model.file.path.name}",
-            "Источник: выбранный файл в защищённой среде VDI",
-            f"Размер: {model.file.size_bytes} bytes",
-            f"SHA-256: {model.file.sha256}",
-            f"Изменён: {model.file.modified_at.isoformat()}",
-            f"Проанализирован: {model.generated_at.isoformat()}",
-            f"Версия генератора: {model.application_version}",
-            f"Версия PBIXRay: {semantic.library_version or 'NOT_AVAILABLE'}",
-            "Профиль значений: SAFE_TOP_5_CATEGORICAL",
-        ]
-    )
-
-    add_section(lines, "2", "Статус извлечения")
-    lines.extend(
-        table(
-            ["Компонент", "Статус", "Подробности"],
-            [
-                ["Общий результат", overall, issue_summary(model)],
-                ["Формат отчёта", report.report_format, report.format_version or "Версия не определена"],
-                ["Листы", "OK" if report.pages else "FAILED", len(report.pages)],
-                ["Визуалы", "OK", len(visuals)],
-                ["Закладки", "OK", len(report.bookmarks)],
-                ["Навигация", "OK", len(report.navigation)],
-                ["Ссылки на поля", "PARTIAL" if unresolved else "OK", f"Разрешено {len(fields) - len(unresolved)} из {len(fields)}"],
-                ["Семантическая модель", semantic.status, f"Таблиц: {len(semantic.tables)}, мер: {len(semantic.measures)}"],
-                ["RLS/OLS", "PROVISIONAL", "Формальная заглушка до боевого прогона"],
-            ],
-        )
-    )
-
-    add_section(lines, "3", "Общие сведения об отчёте")
-    lines.extend(
-        [
-            f"Название: {report.title}",
-            f"Листов: {len(report.pages)}",
-            f"Визуалов: {len(visuals)}",
-            f"Закладок: {len(report.bookmarks)}",
-            f"Навигационных связей: {len(report.navigation)}",
-            f"Фильтров уровня отчёта: {len(report.report_filters)}",
-        ]
-    )
-    if report.report_filters:
-        add_section(lines, "3.1", "Фильтры уровня отчёта")
-        lines.extend(render_filters(report.report_filters))
-
-    add_section(lines, "4", "Список листов")
-    lines.extend(
-        table(
-            ["№", "Лист", "ID", "Видимость", "Тип", "Размер", "Визуалов"],
-            [
-                [
-                    page.order + 1,
-                    page.name,
-                    page.id,
-                    "VISIBLE" if page.visible else "HIDDEN",
-                    page.page_type,
-                    f"{fmt_number(page.width)}x{fmt_number(page.height)}",
-                    len(page.visuals),
-                ]
-                for page in report.pages
-            ],
-        )
-    )
-
-    add_section(lines, "4.1", "Закладки и связанные листы")
-    if report.bookmarks:
-        lines.extend(
-            table(
-                ["№", "Закладка", "ID", "Группа", "Связанный лист", "Состояние", "Визуалов", "Точки входа"],
-                [
-                    [
-                        bookmark.order + 1,
-                        bookmark.name,
-                        bookmark.id,
-                        bookmark.group or "—",
-                        page_by_id.get(bookmark.associated_page_id).name
-                        if bookmark.associated_page_id in page_by_id
-                        else bookmark.associated_page_id or "<НЕ ОПРЕДЕЛЁН>",
-                        bookmark.state_scope or "UNKNOWN",
-                        len(bookmark.affected_visual_ids),
-                        "; ".join(bookmark.trigger_refs) or "<НЕ НАЙДЕНЫ>",
-                    ]
-                    for bookmark in report.bookmarks
-                ],
-            )
-        )
-        lines.append("Сохранённые значения фильтров и срезов закладок: <VALUES HIDDEN>.")
-    else:
-        lines.append("Закладки не найдены.")
-
-    add_section(lines, "4.2", "Навигационный граф: откуда и куда можно перейти")
-    if report.navigation:
-        lines.extend(
-            table(
-                ["Откуда", "Элемент", "Тип", "Цель", "Связанный лист", "Статус"],
-                [
-                    [
-                        edge.source_page_name,
-                        edge.source_visual_title,
-                        edge.action_type,
-                        edge.target_name or "—",
-                        edge.target_page_name or "—",
-                        edge.status,
-                    ]
-                    for edge in report.navigation
-                ],
-            )
-        )
-    else:
-        lines.append("Навигационные связи не найдены.")
-
-    section_number = 5
-    for page in report.pages:
-        add_section(lines, str(section_number), f"Лист: {page.name}")
-        lines.extend(
-            [
-                f"ID: {page.id}",
-                f"Порядок: {page.order + 1}",
-                f"Видимость: {'VISIBLE' if page.visible else 'HIDDEN'}",
-                f"Тип: {page.page_type}",
-                f"Холст: {fmt_number(page.width)} x {fmt_number(page.height)}",
-            ]
-        )
-        add_section(lines, f"{section_number}.1", "Визуальные элементы")
-        lines.extend(
-            table(
-                ["№", "Название", "Категория", "Power BI type", "X", "Y", "W", "H", "Z"],
-                [
-                    [
-                        index,
-                        visual.title,
-                        visual.category,
-                        visual.technical_type,
-                        fmt_number(visual.x),
-                        fmt_number(visual.y),
-                        fmt_number(visual.width),
-                        fmt_number(visual.height),
-                        fmt_number(visual.z),
-                    ]
-                    for index, visual in enumerate(page.visuals, 1)
-                ],
-            )
-            if page.visuals
-            else ["Визуалы не найдены."]
-        )
-
-        add_section(lines, f"{section_number}.2", "Поля визуалов")
-        page_fields = [(visual, field) for visual in page.visuals for field in visual.fields]
-        if page_fields:
-            lines.extend(
-                table(
-                    ["Визуал", "Объект", "Тип", "Роль", "Использование", "Агрегация", "Статус"],
-                    [
-                        [
-                            visual.title,
-                            field.qualified_name,
-                            field.object_type,
-                            field.role or "—",
-                            field.usage,
-                            field.aggregation or "—",
-                            field.status,
-                        ]
-                        for visual, field in page_fields
-                    ],
-                )
-            )
-        else:
-            lines.append("Поля визуалов не найдены.")
-
-        add_section(lines, f"{section_number}.3", "Фильтры")
-        filters = list(page.filters)
-        for visual in page.visuals:
-            filters.extend(visual.filters)
-        lines.extend(render_filters(filters) if filters else ["Фильтры не найдены."])
-
-        add_section(lines, f"{section_number}.4", "Связанные закладки")
-        associated = [bookmark for bookmark in report.bookmarks if bookmark.associated_page_id == page.id]
-        if associated:
-            lines.extend(
-                table(
-                    ["Закладка", "Группа", "Точки входа", "Затронутые визуалы"],
-                    [
-                        [
-                            bookmark.name,
-                            bookmark.group or "—",
-                            "; ".join(bookmark.trigger_refs) or "<НЕ НАЙДЕНЫ>",
-                            "; ".join(bookmark.affected_visual_ids) or "<НЕ ОПРЕДЕЛЕНЫ>",
-                        ]
-                        for bookmark in associated
-                    ],
-                )
-            )
-        else:
-            lines.append("Закладки, связанные с листом, не найдены.")
-
-        outgoing = [edge for edge in report.navigation if edge.source_page_id == page.id]
-        incoming = [edge for edge in report.navigation if edge.target_page_id == page.id]
-        add_section(lines, f"{section_number}.5", "Исходящие переходы")
-        lines.extend(render_navigation(outgoing, incoming=False) if outgoing else ["Исходящие переходы не найдены."])
-        add_section(lines, f"{section_number}.6", "Входящие переходы")
-        lines.extend(render_navigation(incoming, incoming=True) if incoming else ["Входящие переходы не найдены."])
-        section_number += 1
-
-    add_section(lines, str(section_number), "Семантическая модель")
-    lines.extend(render_semantic_model(model))
-    section_number += 1
-
-    add_section(lines, str(section_number), "Power Query и источники")
-    if semantic.queries:
-        lines.extend(
-            table(
-                ["Запрос", "Тип", "Выражение"],
-                [[query.name, query.kind, "DEFINED; CONTENT OMITTED IN SAFE MODE" if query.expression_available else "NOT_AVAILABLE"] for query in semantic.queries],
-            )
-        )
-    else:
-        lines.append("Power Query metadata: NOT_AVAILABLE.")
-    lines.append(
-        "Типы подключений: " + (", ".join(semantic.connection_types) if semantic.connection_types else "не определены")
-    )
-    section_number += 1
-
-    add_section(lines, str(section_number), "RLS и OLS — формальная заглушка")
-    lines.append("Статус анализа: PROVISIONAL до первого прогона на боевом PBIX.")
-    lines.append(f"RLS metadata: {'FOUND' if semantic.rls else 'NOT_FOUND_OR_NOT_AVAILABLE'}")
-    if semantic.rls:
-        lines.extend(
-            table(
-                ["Роль", "Таблица", "Выражение", "Разрешение"],
-                [
-                    [rule.role, rule.table or "—", sanitize_dax_literals(rule.expression), rule.permission or "—"]
-                    for rule in semantic.rls
-                ],
-            )
-        )
-    lines.append(f"OLS metadata: {'FOUND' if semantic.ols else 'NOT_FOUND_OR_NOT_AVAILABLE'}")
-    if semantic.ols:
-        lines.extend(
-            table(
-                ["Роль", "Таблица", "Колонка", "Разрешение"],
-                [[rule.role, rule.table or "—", rule.column or "—", rule.permission or "—"] for rule in semantic.ols],
-            )
-        )
-    lines.append("Логины, UPN, пользователи и назначения ролей не выводятся.")
-    section_number += 1
-
-    add_section(lines, str(section_number), "Неразрешённые ссылки")
-    if unresolved:
-        lines.extend(
-            table(
-                ["Объект", "Роль", "Причина", "Путь-источник"],
-                [[field.qualified_name, field.role or "—", field.reason or "Не указана", field.source_path] for field in unresolved],
-            )
-        )
-    else:
-        lines.append("Неразрешённых ссылок не найдено.")
-    section_number += 1
-
-    add_section(lines, str(section_number), "Диагностика извлечения")
-    if model.issues:
-        lines.extend(
-            table(
-                ["Уровень", "Компонент", "Код", "Сообщение", "Источник"],
-                [[issue.severity, issue.component, issue.code, issue.message, issue.source_path or "—"] for issue in model.issues],
-            )
-        )
-    else:
-        lines.append("Предупреждения и ошибки отсутствуют.")
-    lines.extend(["", f"ИТОГОВЫЙ СТАТУС: {overall}", LINE])
-    return "\r\n".join(lines) + "\r\n"
+def render_document(model: SafeDocumentModel) -> bytes:
+    document = Document()
+    _configure_document(document)
+    _add_cover(document, model)
+    for block in model.blocks:
+        if isinstance(block, HeadingBlock):
+            _add_heading(document, block)
+        elif isinstance(block, ParagraphBlock):
+            _add_paragraph(document, block)
+        elif isinstance(block, ListBlock):
+            _add_list(document, block)
+        elif isinstance(block, TableBlock):
+            _add_table(document, block)
+        elif isinstance(block, CodeBlock):
+            _add_code(document, block)
+    stream = BytesIO()
+    document.save(stream)
+    return _canonicalize_package(stream.getvalue())
 
 
-def render_semantic_model(model: DocumentationModel) -> list[str]:
-    semantic = model.semantic_model
-    lines = [f"Статус: {semantic.status}"]
-    if not semantic.tables and not semantic.measures:
-        lines.append("Локальная семантическая модель недоступна.")
-        return lines
-    if semantic.tables:
-        lines.extend(
-            table(
-                ["Таблица", "Скрыта", "Режим", "Колонок"],
-                [[item.name, yes_no(item.hidden), item.storage_mode or "—", len(item.columns)] for item in semantic.tables],
-            )
-        )
-        columns = [column for table_info in semantic.tables for column in table_info.columns]
-        lines.extend(["", "Колонки и безопасные примеры:"])
-        lines.extend(
-            table(
-                ["Таблица", "Колонка", "Тип", "Скрыта", "Уникальных", "Примеры / статус"],
-                [
-                    [
-                        column.table,
-                        column.name,
-                        column.data_type or "—",
-                        yes_no(column.hidden),
-                        column.cardinality if column.cardinality is not None else "—",
-                        "; ".join(column.examples) if column.examples else f"<{column.example_status}>",
-                    ]
-                    for column in columns
-                ],
-            )
-        )
-    if semantic.measures:
-        lines.extend(["", "Меры и DAX:"])
-        for measure in semantic.measures:
-            lines.extend(
-                [
-                    f"Мера: {measure.table}[{measure.name}]",
-                    f"Формат: {measure.format_string or '—'}",
-                    f"Папка: {measure.display_folder or '—'}",
-                    f"Описание: {measure.description or '—'}",
-                    "DAX:",
-                    measure.expression,
-                    "",
-                ]
-            )
-    if semantic.relationships:
-        lines.extend(["Связи:"])
-        lines.extend(
-            table(
-                ["Из", "В", "Кардинальность", "Активна", "Фильтрация", "Security filter"],
-                [
-                    [
-                        rel.from_object,
-                        rel.to_object,
-                        rel.cardinality or "—",
-                        yes_no(rel.active),
-                        rel.filter_direction or "—",
-                        rel.security_filter or "—",
-                    ]
-                    for rel in semantic.relationships
-                ],
-            )
-        )
-    return lines
-
-
-def render_filters(filters: Iterable[Any]) -> list[str]:
-    return table(
-        ["Область", "Поле", "Тип", "Сохранено значений", "Значения"],
-        [[item.scope, item.field, item.filter_type, item.saved_value_count, "<VALUES HIDDEN>"] for item in filters],
-    )
-
-
-def render_navigation(edges: Iterable[Any], incoming: bool) -> list[str]:
-    if incoming:
-        return table(
-            ["Исходный лист", "Элемент", "Тип", "Цель", "Статус"],
-            [[edge.source_page_name, edge.source_visual_title, edge.action_type, edge.target_name or "—", edge.status] for edge in edges],
-        )
-    return table(
-        ["Элемент", "Тип", "Цель", "Связанный лист", "Статус"],
-        [[edge.source_visual_title, edge.action_type, edge.target_name or "—", edge.target_page_name or "—", edge.status] for edge in edges],
-    )
-
-
-def overall_status(model: DocumentationModel) -> str:
-    if not model.report.pages:
-        return "FAILED"
-    if any(issue.severity in {"ERROR", "WARNING"} for issue in model.issues):
-        return "PARTIAL"
-    return "OK"
-
-
-def issue_summary(model: DocumentationModel) -> str:
-    errors = sum(issue.severity == "ERROR" for issue in model.issues)
-    warnings = sum(issue.severity == "WARNING" for issue in model.issues)
-    return f"Ошибок: {errors}, предупреждений: {warnings}"
-
-
-def sanitize_dax_literals(expression: str | None) -> str:
-    if not expression:
-        return "—"
-    return re.sub(r'"(?:[^"]|"")*"', '"<VALUE>"', expression)
-
-
-def yes_no(value: bool | None) -> str:
-    if value is None:
-        return "—"
-    return "Да" if value else "Нет"
-
-
-def fmt_number(value: float | None) -> str:
-    if value is None:
-        return "—"
-    return str(int(value)) if value.is_integer() else f"{value:g}"
-
-
-def add_section(lines: list[str], number: str, title: str) -> None:
-    lines.extend(["", f"{number}. {title}", SUBLINE])
-
-
-def display(value: Any) -> str:
-    if value is None:
-        return "—"
-    if isinstance(value, bool):
-        return "Да" if value else "Нет"
-    return str(value)
-
-
-def clipped(value: Any, limit: int = 72) -> str:
-    text = " ".join(display(value).replace("\t", " ").splitlines()).strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "…"
-
-
-def table(headers: list[str], rows: Iterable[Iterable[Any]]) -> list[str]:
-    rendered = [[clipped(cell) for cell in row] for row in rows]
-    widths = [len(header) for header in headers]
-    for row in rendered:
-        for index, cell in enumerate(row):
-            widths[index] = max(widths[index], len(cell))
-    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
-
-    def row_line(row: list[str]) -> str:
-        return "|" + "|".join(f" {cell:<{width}} " for cell, width in zip(row, widths)) + "|"
-
-    result = [border, row_line(headers), border]
-    result.extend(row_line(row) for row in rendered)
-    result.append(border)
-    return result
-
-
-def atomic_write(output_path: Path, document: str) -> None:
+def atomic_write(output_path: Path, payload: bytes) -> None:
     output_path = output_path.resolve()
-    if output_path.suffix.casefold() != ".txt":
-        raise ValueError("Выходной файл должен иметь расширение .txt")
+    if output_path.suffix.casefold() != ".docx":
+        raise ValueError("Выходной файл должен иметь расширение .docx")
     if not output_path.parent.is_dir():
         raise FileNotFoundError(output_path.parent)
     cleanup_stale_artifacts(output_path.parent)
@@ -470,11 +75,316 @@ def atomic_write(output_path: Path, document: str) -> None:
             delete=False,
         ) as stream:
             temporary = Path(stream.name)
-            stream.write(codecs.BOM_UTF8)
-            stream.write(document.encode("utf-8"))
+            stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
+        validate_docx(temporary)
         os.replace(temporary, output_path)
     finally:
         if temporary and temporary.exists():
             temporary.unlink()
+
+
+def _configure_document(document: DocumentObject) -> None:
+    section = document.sections[0]
+    section.page_width = Inches(8.5)
+    section.page_height = Inches(11)
+    section.top_margin = Inches(1)
+    section.right_margin = Inches(1)
+    section.bottom_margin = Inches(1)
+    section.left_margin = Inches(1)
+    section.header_distance = Inches(0.492)
+    section.footer_distance = Inches(0.492)
+
+    normal = document.styles["Normal"]
+    _set_style_font(normal, "Arial", 11, "000000")
+    normal.paragraph_format.space_before = Pt(0)
+    normal.paragraph_format.space_after = Pt(6)
+    normal.paragraph_format.line_spacing = 1.25
+
+    settings = {
+        "Heading 1": (16, BLUE, 18, 10),
+        "Heading 2": (13, BLUE, 14, 7),
+        "Heading 3": (12, DARK_BLUE, 10, 5),
+    }
+    for name, (size, color, before, after) in settings.items():
+        style = document.styles[name]
+        _set_style_font(style, "Arial", size, color, bold=True)
+        style.paragraph_format.space_before = Pt(before)
+        style.paragraph_format.space_after = Pt(after)
+        style.paragraph_format.keep_with_next = True
+
+    for name in ("List Bullet", "List Number"):
+        style = document.styles[name]
+        _set_style_font(style, "Arial", 11, "000000")
+        style.paragraph_format.left_indent = Inches(0.375)
+        style.paragraph_format.first_line_indent = Inches(-0.188)
+        style.paragraph_format.space_after = Pt(4)
+        style.paragraph_format.line_spacing = 1.25
+
+    document.core_properties.title = "Документация Power BI"
+    document.core_properties.subject = "Локальная документация PBIX для Confluence"
+    document.core_properties.author = "PBIX Converter"
+    document.core_properties.last_modified_by = "PBIX Converter"
+    document.core_properties.comments = "Generated locally; no external relationships"
+
+
+def _add_cover(document: DocumentObject, model: SafeDocumentModel) -> None:
+    generated = model.generated_at.replace(tzinfo=None)
+    document.core_properties.created = generated
+    document.core_properties.modified = generated
+    spacer = document.add_paragraph()
+    spacer.paragraph_format.space_after = Pt(44)
+
+    kicker = document.add_paragraph()
+    kicker.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    kicker.paragraph_format.space_after = Pt(14)
+    run = kicker.add_run("POWER BI · ТЕХНИЧЕСКОЕ РУКОВОДСТВО")
+    _set_run_font(run, "Arial", 10, BLUE, bold=True)
+
+    title = document.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.space_after = Pt(8)
+    run = title.add_run(clean_text(model.title))
+    _set_run_font(run, "Arial", 26, DARK_BLUE, bold=True)
+
+    subtitle = document.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle.paragraph_format.space_after = Pt(28)
+    run = subtitle.add_run(clean_text(model.subtitle))
+    _set_run_font(run, "Arial", 13, MUTED)
+
+    cover_table = TableBlock(
+        ("Параметр", "Значение"),
+        [
+            ("Исходный файл", model.source_name),
+            ("Статус", model.overall_status),
+            ("Сформирован", model.generated_at.isoformat()),
+            ("Режим", "Локальная обработка в защищённой среде VDI"),
+            ("Назначение", "Ручной импорт DOCX в Atlassian Confluence Data Center"),
+        ],
+        (2_300, 7_060),
+    )
+    _add_table(document, cover_table)
+    note = document.add_paragraph()
+    note.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    note.paragraph_format.space_before = Pt(18)
+    run = note.add_run("Детальные строки данных и сохранённые значения фильтров в документ не включаются.")
+    _set_run_font(run, "Arial", 9.5, MUTED, italic=True)
+
+    document.add_section(WD_SECTION.NEW_PAGE)
+
+
+def _canonicalize_package(payload: bytes) -> bytes:
+    source = BytesIO(payload)
+    target = BytesIO()
+    with zipfile.ZipFile(source) as archive, zipfile.ZipFile(
+        target,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as output:
+        for name in sorted(archive.namelist(), key=str.casefold):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o100644 << 16
+            output.writestr(info, archive.read(name))
+    return target.getvalue()
+
+
+def _add_heading(document: DocumentObject, block: HeadingBlock) -> None:
+    text = clean_text(block.text, limit=500)
+    document.add_heading(text, level=min(3, max(1, block.level)))
+
+
+def _add_paragraph(document: DocumentObject, block: ParagraphBlock) -> None:
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.space_after = Pt(7)
+    if block.kind in {"lead", "note", "warning", "status"}:
+        _shade_paragraph(paragraph, LIGHT_GRAY if block.kind in {"lead", "note"} else "FFF4CE")
+        paragraph.paragraph_format.left_indent = Inches(0.12)
+        paragraph.paragraph_format.right_indent = Inches(0.12)
+        paragraph.paragraph_format.space_before = Pt(3)
+        paragraph.paragraph_format.space_after = Pt(8)
+    run = paragraph.add_run(clean_text(block.text, preserve_newlines=True, limit=12_000))
+    color = RED if block.kind == "warning" else GOLD if block.kind == "status" else "000000"
+    _set_run_font(run, "Arial", 10.5 if block.kind != "normal" else 11, color, bold=block.kind == "status")
+
+
+def _add_list(document: DocumentObject, block: ListBlock) -> None:
+    style = "List Number" if block.ordered else "List Bullet"
+    for item in block.items:
+        paragraph = document.add_paragraph(style=style)
+        run = paragraph.add_run(clean_text(item, limit=2_000))
+        _set_run_font(run, "Arial", 11, "000000")
+
+
+def _add_table(document: DocumentObject, block: TableBlock) -> None:
+    if not block.headers or len(block.headers) > 5:
+        raise ValueError("DOCX-таблица должна содержать от одной до пяти колонок")
+    if len(block.headers) != len(block.widths_dxa) or sum(block.widths_dxa) != CONTENT_WIDTH_DXA:
+        raise ValueError("Некорректная геометрия DOCX-таблицы")
+    table = document.add_table(rows=1, cols=len(block.headers))
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    table.autofit = False
+    header = table.rows[0]
+    _repeat_header(header)
+    for index, value in enumerate(block.headers):
+        _set_cell_text(header.cells[index], value, bold=True, color=DARK_BLUE, fill=LIGHT_BLUE)
+    for values in block.rows:
+        if len(values) != len(block.headers):
+            raise ValueError("Строка DOCX-таблицы не совпадает с заголовком")
+        row = table.add_row()
+        for index, value in enumerate(values):
+            _set_cell_text(row.cells[index], value)
+    _set_table_geometry(table, block.widths_dxa)
+    for row in table.rows:
+        _prevent_row_split(row)
+    after = document.add_paragraph()
+    after.paragraph_format.space_after = Pt(2)
+
+
+def _add_code(document: DocumentObject, block: CodeBlock) -> None:
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.left_indent = Inches(0.12)
+    paragraph.paragraph_format.right_indent = Inches(0.12)
+    paragraph.paragraph_format.space_before = Pt(2)
+    paragraph.paragraph_format.space_after = Pt(8)
+    paragraph.paragraph_format.line_spacing = 1.0
+    _shade_paragraph(paragraph, LIGHT_GRAY)
+    run = paragraph.add_run(clean_text(block.text, preserve_newlines=True, limit=12_000))
+    _set_run_font(run, "Consolas", 9, "202124")
+    if block.status != "OK":
+        status = paragraph.add_run(f"\n[{clean_text(block.status)}]")
+        _set_run_font(status, "Arial", 9, GOLD, bold=True)
+
+
+def _set_cell_text(
+    cell: object,
+    value: object,
+    *,
+    bold: bool = False,
+    color: str = "000000",
+    fill: str | None = None,
+) -> None:
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    _set_cell_margins(cell, top=80, bottom=80, start=120, end=120)
+    paragraph = cell.paragraphs[0]
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(0)
+    paragraph.paragraph_format.line_spacing = 1.05
+    paragraph.paragraph_format.keep_with_next = bold
+    run = paragraph.add_run(clean_text(value, preserve_newlines=True, limit=4_000))
+    _set_run_font(run, "Arial", 9.2, color, bold=bold)
+    if fill:
+        shading = OxmlElement("w:shd")
+        shading.set(qn("w:fill"), fill)
+        cell._tc.get_or_add_tcPr().append(shading)
+
+
+def _set_table_geometry(table: object, widths: tuple[int, ...]) -> None:
+    properties = table._tbl.tblPr
+    width = properties.first_child_found_in("w:tblW")
+    if width is None:
+        width = OxmlElement("w:tblW")
+        properties.append(width)
+    width.set(qn("w:w"), str(CONTENT_WIDTH_DXA))
+    width.set(qn("w:type"), "dxa")
+    indent = properties.first_child_found_in("w:tblInd")
+    if indent is None:
+        indent = OxmlElement("w:tblInd")
+        properties.append(indent)
+    indent.set(qn("w:w"), "120")
+    indent.set(qn("w:type"), "dxa")
+    layout = properties.first_child_found_in("w:tblLayout")
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        properties.append(layout)
+    layout.set(qn("w:type"), "fixed")
+
+    grid = table._tbl.tblGrid
+    for child in list(grid):
+        grid.remove(child)
+    for value in widths:
+        column = OxmlElement("w:gridCol")
+        column.set(qn("w:w"), str(value))
+        grid.append(column)
+    for row in table.rows:
+        for index, cell in enumerate(row.cells):
+            cell.width = Inches(widths[index] / 1440)
+            tc_width = cell._tc.get_or_add_tcPr().get_or_add_tcW()
+            tc_width.set(qn("w:w"), str(widths[index]))
+            tc_width.set(qn("w:type"), "dxa")
+
+
+def _set_cell_margins(cell: object, **values: int) -> None:
+    properties = cell._tc.get_or_add_tcPr()
+    margins = properties.first_child_found_in("w:tcMar")
+    if margins is None:
+        margins = OxmlElement("w:tcMar")
+        properties.append(margins)
+    for edge in ("top", "start", "bottom", "end"):
+        node = margins.find(qn(f"w:{edge}"))
+        if node is None:
+            node = OxmlElement(f"w:{edge}")
+            margins.append(node)
+        node.set(qn("w:w"), str(values.get(edge, 80)))
+        node.set(qn("w:type"), "dxa")
+
+
+def _repeat_header(row: object) -> None:
+    properties = row._tr.get_or_add_trPr()
+    header = OxmlElement("w:tblHeader")
+    header.set(qn("w:val"), "true")
+    properties.append(header)
+
+
+def _prevent_row_split(row: object) -> None:
+    properties = row._tr.get_or_add_trPr()
+    if properties.find(qn("w:cantSplit")) is None:
+        properties.append(OxmlElement("w:cantSplit"))
+
+
+def _shade_paragraph(paragraph: object, fill: str) -> None:
+    properties = paragraph._p.get_or_add_pPr()
+    shading = OxmlElement("w:shd")
+    shading.set(qn("w:fill"), fill)
+    properties.append(shading)
+
+
+def _set_style_font(
+    style: object,
+    name: str,
+    size: float,
+    color: str,
+    *,
+    bold: bool | None = None,
+) -> None:
+    style.font.name = name
+    style._element.get_or_add_rPr().rFonts.set(qn("w:ascii"), name)
+    style._element.get_or_add_rPr().rFonts.set(qn("w:hAnsi"), name)
+    style.font.size = Pt(size)
+    style.font.color.rgb = RGBColor.from_string(color)
+    if bold is not None:
+        style.font.bold = bold
+
+
+def _set_run_font(
+    run: object,
+    name: str,
+    size: float,
+    color: str,
+    *,
+    bold: bool | None = None,
+    italic: bool | None = None,
+) -> None:
+    run.font.name = name
+    run._element.get_or_add_rPr().rFonts.set(qn("w:ascii"), name)
+    run._element.get_or_add_rPr().rFonts.set(qn("w:hAnsi"), name)
+    run.font.size = Pt(size)
+    run.font.color.rgb = RGBColor.from_string(color)
+    if bold is not None:
+        run.bold = bold
+    if italic is not None:
+        run.italic = italic

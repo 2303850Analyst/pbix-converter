@@ -14,8 +14,11 @@ import types
 import unittest
 import zipfile
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+
+from docx import Document
 
 from pbix_doc.container import PbixContainer, UnsupportedPbixError
 from pbix_doc.domain import (
@@ -28,6 +31,8 @@ from pbix_doc.domain import (
 )
 from pbix_doc.cli import build_parser, main
 from pbix_doc.pipeline import Options, generate_documentation, resolve_fields
+from pbix_doc.ooxml import UnsafeDocxError, validate_docx
+from pbix_doc.projector import HeadingBlock, SafeDocumentModel, project_document, sanitize_dax
 from pbix_doc.renderer import atomic_write, render_document
 from pbix_doc.report import parse_report
 from pbix_doc.runtime import (
@@ -39,6 +44,15 @@ from pbix_doc.runtime import (
     install_runtime_guards,
 )
 from pbix_doc.semantic import load_semantic_model, profile_examples, safe_error_message
+
+
+def read_docx_text(payload: bytes | Path) -> str:
+    document = Document(BytesIO(payload) if isinstance(payload, bytes) else payload)
+    values = [paragraph.text for paragraph in document.paragraphs]
+    for table in document.tables:
+        for row in table.rows:
+            values.extend(cell.text for cell in row.cells)
+    return "\n".join(values)
 
 
 def write_zip(path: Path, parts: dict[str, object]) -> None:
@@ -56,6 +70,23 @@ def pbir_parts() -> dict[str, object]:
         "Column": {
             "Expression": {"SourceRef": {"Entity": "Sales"}},
             "Property": "Region",
+        }
+    }
+    revenue_measure = {
+        "Measure": {
+            "Expression": {"SourceRef": {"Entity": "Sales"}},
+            "Property": "Selected region",
+        }
+    }
+    amount_aggregation = {
+        "Aggregation": {
+            "Expression": {
+                "Column": {
+                    "Expression": {"SourceRef": {"Entity": "Sales"}},
+                    "Property": "Amount",
+                }
+            },
+            "Function": 0,
         }
     }
     return {
@@ -84,6 +115,32 @@ def pbir_parts() -> dict[str, object]:
             "displayName": "Детали",
             "width": 1280,
             "height": 720,
+            "filterConfig": {
+                "filters": [
+                    {
+                        "type": "Categorical",
+                        "field": sales_field,
+                        "condition": {"In": [{"Literal": {"Value": "Другой секрет"}}]},
+                    }
+                ]
+            },
+        },
+        "Report/definition/pages/overview/visuals/revenue/visual.json": {
+            "name": "revenue",
+            "title": "Выручка",
+            "position": {"x": 540, "y": 20, "z": 0, "width": 220, "height": 100},
+            "visual": {
+                "visualType": "card",
+                "query": {
+                    "queryState": {
+                        "Values": {
+                            "projections": [
+                                {"queryRef": "Sales.Selected region", "field": revenue_measure}
+                            ]
+                        }
+                    }
+                },
+            },
         },
         "Report/definition/pages/overview/visuals/chart/visual.json": {
             "name": "chart",
@@ -115,6 +172,23 @@ def pbir_parts() -> dict[str, object]:
             "position": {"x": 10, "y": 10, "z": 0, "width": 160, "height": 40},
             "visual": {"visualType": "actionButton"},
             "actions": [{"type": "BOOKMARK_NAVIGATION", "target": "bookmark_overview"}],
+        },
+        "Report/definition/pages/details/visuals/revenue/visual.json": {
+            "name": "details_revenue",
+            "title": "Выручка",
+            "position": {"x": 200, "y": 10, "z": 1, "width": 220, "height": 100},
+            "visual": {
+                "visualType": "card",
+                "query": {
+                    "queryState": {
+                        "Values": {
+                            "projections": [
+                                {"queryRef": "Sum(Sales.Amount)", "field": amount_aggregation}
+                            ]
+                        }
+                    }
+                },
+            },
         },
         "Report/definition/bookmarks/bookmarks.json": {
             "items": [{"name": "bookmark_overview", "displayName": "Исходный вид"}]
@@ -175,7 +249,8 @@ class ReportParserTests(unittest.TestCase):
 
         self.assertEqual(report.report_format, "PBIR")
         self.assertEqual([page.name for page in report.pages], ["Обзор", "Детали"])
-        self.assertEqual(report.pages[0].visuals[0].fields[0].qualified_name, "Sales[Region]")
+        chart = next(item for item in report.pages[0].visuals if item.id == "chart")
+        self.assertEqual(chart.fields[0].qualified_name, "Sales[Region]")
         self.assertEqual(report.bookmarks[0].associated_page_id, "overview")
         self.assertEqual(report.bookmarks[0].affected_visual_ids, ["chart"])
         self.assertEqual(len(report.navigation), 2)
@@ -206,7 +281,7 @@ class ReportParserTests(unittest.TestCase):
 
 
 class RendererTests(unittest.TestCase):
-    def test_values_are_hidden_and_top_examples_are_bounded(self) -> None:
+    def test_docx_is_user_facing_and_values_are_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "fixture.pbix")
             write_zip(path, pbir_parts())
@@ -229,7 +304,15 @@ class RendererTests(unittest.TestCase):
                                 5,
                                 examples=["Центр", "Север", "Юг", "Запад", "Восток"],
                                 example_status="PROFILED",
-                            )
+                            ),
+                            ColumnInfo(
+                                "Sales",
+                                "Amount",
+                                "Decimal",
+                                False,
+                                1000,
+                                example_status="NUMERIC_VALUES_HIDDEN",
+                            ),
                         ],
                     )
                 ],
@@ -253,36 +336,103 @@ class RendererTests(unittest.TestCase):
                 datetime.now(timezone.utc),
                 "test",
             )
-            text = render_document(model)
+            payload = render_document(project_document(model))
+            text = read_docx_text(payload)
 
-        self.assertIn("Закладки и связанные листы", text)
-        self.assertIn("Исходящие переходы", text)
-        self.assertIn("Входящие переходы", text)
+        self.assertIn("Кнопки, закладки и переходы", text)
+        self.assertIn("Пользовательские маршруты", text)
+        self.assertIn("Одинаковое название — возможные различия", text)
+        self.assertIn("РАЗЛИЧИЕ ОПРЕДЕЛЕНИЙ", text)
+        self.assertIn("Каталог KPI и вычислений", text)
         self.assertIn("<VALUES HIDDEN>", text)
         self.assertNotIn("Секретный регион", text)
+        self.assertNotIn("Другой секрет", text)
         self.assertNotIn("Никогда не печатать", text)
         self.assertNotIn(str(path.resolve()), text)
-        self.assertIn("Источник: выбранный файл в защищённой среде VDI", text)
-        self.assertIn('Sales[Region] = "North"', text)
+        self.assertIn("Источник", text)
+        self.assertIn('Sales[Region] = "<VALUE>"', text)
+        self.assertNotIn('"North"', text)
         self.assertEqual(sum(value in text for value in ["Центр", "Север", "Юг", "Запад", "Восток"]), 5)
+        with zipfile.ZipFile(BytesIO(payload)) as archive:
+            names = archive.namelist()
+            relations = b"\n".join(
+                archive.read(name) for name in names if name.casefold().endswith(".rels")
+            )
+            document_xml = archive.read("word/document.xml")
+        self.assertNotIn(b'TargetMode="External"', relations)
+        self.assertNotIn(b"vbaProject", b"\n".join(name.encode() for name in names))
+        self.assertIn(b"w:tblGrid", document_xml)
+        self.assertIn(b"w:tblHeader", document_xml)
 
-    def test_atomic_writer_uses_utf8_bom_and_crlf(self) -> None:
+    def test_atomic_writer_publishes_valid_docx(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory, "output.txt")
-            atomic_write(output, "one\r\ntwo\r\n")
+            path = Path(directory, "fixture.pbix")
+            write_zip(path, pbir_parts())
+            issues = []
+            with PbixContainer(path) as container:
+                report = parse_report(container, path.stem, issues)
+            model = DocumentationModel(
+                FileInfo(path, path.stat().st_size, "0" * 64, datetime.now(timezone.utc)),
+                report,
+                SemanticModelInfo("NO_MODEL"),
+                issues,
+                datetime.now(timezone.utc),
+                "test",
+            )
+            output = Path(directory, "output.docx")
+            atomic_write(output, render_document(project_document(model)))
+            validate_docx(output)
             content = output.read_bytes()
-        self.assertTrue(content.startswith(codecs.BOM_UTF8))
-        self.assertIn(b"one\r\ntwo\r\n", content)
+        self.assertTrue(content.startswith(b"PK"))
+
+    def test_dax_sanitizer_is_token_aware_and_fails_closed(self) -> None:
+        safe = sanitize_dax('CALCULATE([Revenue], Sales[Region] = "N""orth") // secret')
+        malformed = sanitize_dax('CALCULATE([Revenue], "unfinished)')
+        self.assertEqual(safe.status, "OK")
+        self.assertIn('"<VALUE>"', safe.text or "")
+        self.assertNotIn("secret", safe.text or "")
+        self.assertIn("[Revenue]", safe.references)
+        self.assertEqual(malformed.status, "PARTIAL")
+        self.assertIsNone(malformed.text)
+
+    def test_render_is_deterministic_and_txt_is_rejected(self) -> None:
+        generated = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+        model = SafeDocumentModel("Отчёт", "Описание", "fixture.pbix", generated, "OK", [HeadingBlock(1, "Раздел")])
+        first = render_document(model)
+        second = render_document(model)
+        self.assertEqual(first, second)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
+            atomic_write(Path(directory, "legacy.txt"), first)
+
+    def test_ooxml_validator_rejects_external_relationship(self) -> None:
+        generated = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+        payload = render_document(
+            SafeDocumentModel("Отчёт", "Описание", "fixture.pbix", generated, "OK", [])
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "unsafe.docx")
+            with zipfile.ZipFile(BytesIO(payload)) as source, zipfile.ZipFile(path, "w") as target:
+                for name in source.namelist():
+                    data = source.read(name)
+                    if name == "_rels/.rels":
+                        data = data.replace(
+                            b"</Relationships>",
+                            b'<Relationship Id="rExternal" Type="x" Target="https://example.org" '
+                            b'TargetMode="External"/></Relationships>',
+                        )
+                    target.writestr(name, data)
+            with self.assertRaises(UnsafeDocxError):
+                validate_docx(path)
 
 
 class PipelineTests(unittest.TestCase):
     def test_end_to_end_without_embedded_model_is_partial(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             input_path = Path(directory, "fixture.pbix")
-            output_path = Path(directory, "result.txt")
+            output_path = Path(directory, "result.docx")
             write_zip(input_path, pbir_parts())
             model = generate_documentation(input_path, output_path, Options(example_limit=5))
-            text = output_path.read_text(encoding="utf-8-sig")
+            text = read_docx_text(output_path)
             output_exists = output_path.exists()
 
         self.assertTrue(output_exists)
@@ -302,7 +452,7 @@ class PipelineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             input_path = Path(directory, "fixture.pbix")
-            output_path = Path(directory, "result.txt")
+            output_path = Path(directory, "result.docx")
             write_zip(input_path, pbir_parts())
             with patch("pbix_doc.pipeline.load_semantic_model", side_effect=fake_model):
                 generate_documentation(input_path, output_path, Options(example_limit=100))
@@ -368,12 +518,12 @@ class RuntimePolicyTests(unittest.TestCase):
 
     def test_cli_has_no_temp_directory_override(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            build_parser().parse_args(["input.pbix", "output.txt", "--temp-dir", os.curdir])
+            build_parser().parse_args(["input.pbix", "output.docx", "--temp-dir", os.curdir])
 
     def test_cli_reports_compact_error_without_traceback(self) -> None:
         errors = io.StringIO()
         with contextlib.redirect_stderr(errors):
-            exit_code = main(["missing.pbix", "output.txt"])
+            exit_code = main(["missing.pbix", "output.docx"])
         self.assertEqual(exit_code, 1)
         self.assertIn("Ошибка:", errors.getvalue())
         self.assertNotIn("Traceback", errors.getvalue())
@@ -384,7 +534,7 @@ class RuntimePolicyTests(unittest.TestCase):
             patch("pbix_doc.cli.generate_documentation", side_effect=NetworkEgressViolation("blocked")),
             contextlib.redirect_stderr(errors),
         ):
-            exit_code = main(["input.pbix", "output.txt"])
+            exit_code = main(["input.pbix", "output.docx"])
         self.assertEqual(exit_code, 4)
         self.assertIn("Критическая ошибка политики VDI", errors.getvalue())
         self.assertNotIn("Traceback", errors.getvalue())

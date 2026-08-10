@@ -8,14 +8,14 @@ from typing import Sequence
 from . import __version__
 from .gui import launch_gui
 from .pipeline import MAX_EXAMPLE_VALUES, Options, generate_documentation
-from .renderer import overall_status
+from .projector import overall_status
 from .runtime import RuntimePolicyViolation
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pbix-doc", description="Local PBIX to TXT documentation generator")
+    parser = argparse.ArgumentParser(prog="pbix-doc", description="Local PBIX to DOCX documentation generator")
     parser.add_argument("input", nargs="?", type=Path, help="Input .pbix file")
-    parser.add_argument("output", nargs="?", type=Path, help="Output .txt file")
+    parser.add_argument("output", nargs="?", type=Path, help="Output .docx file")
     parser.add_argument("--examples", type=int, default=5, help="Maximum categorical examples per column")
     parser.add_argument("--no-examples", action="store_true", help="Disable column value profiling")
     parser.add_argument("--version", action="version", version=__version__)
@@ -28,7 +28,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.input is None and args.output is None:
         return launch_gui(limit)
     if args.input is None or args.output is None:
-        raise SystemExit("Для CLI необходимо указать и входной PBIX, и выходной TXT")
+        raise SystemExit("Для CLI необходимо указать и входной PBIX, и выходной DOCX")
 
     try:
         model = generate_documentation(
