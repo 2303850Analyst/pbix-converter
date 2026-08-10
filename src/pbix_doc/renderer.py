@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .domain import DocumentationModel
+from .runtime import atomic_temp_prefix, cleanup_stale_artifacts
 
 
 LINE = "=" * 110
@@ -28,7 +29,7 @@ def render_document(model: DocumentationModel) -> str:
     lines.extend(
         [
             f"Имя: {model.file.path.name}",
-            f"Путь: {model.file.path}",
+            "Источник: выбранный файл в защищённой среде VDI",
             f"Размер: {model.file.size_bytes} bytes",
             f"SHA-256: {model.file.sha256}",
             f"Изменён: {model.file.modified_at.isoformat()}",
@@ -458,11 +459,12 @@ def atomic_write(output_path: Path, document: str) -> None:
         raise ValueError("Выходной файл должен иметь расширение .txt")
     if not output_path.parent.is_dir():
         raise FileNotFoundError(output_path.parent)
+    cleanup_stale_artifacts(output_path.parent)
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb",
-            prefix=f".{output_path.stem}_",
+            prefix=atomic_temp_prefix(),
             suffix=".tmp",
             dir=output_path.parent,
             delete=False,

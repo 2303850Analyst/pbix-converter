@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import queue
 import threading
-import traceback
 from pathlib import Path
 from tkinter import Tk, filedialog, messagebox
 from tkinter import ttk
 
-from .pipeline import Options, generate_documentation
+from .pipeline import MAX_EXAMPLE_VALUES, Options, generate_documentation
 from .renderer import overall_status
 
 
@@ -62,12 +61,12 @@ def launch_gui(example_limit: int = 5) -> int:
             model = generate_documentation(
                 input_path,
                 Path(output_name),
-                Options(example_limit=max(0, example_limit)),
+                Options(example_limit=min(MAX_EXAMPLE_VALUES, max(0, example_limit))),
                 progress,
             )
             messages.put(("success", model))
         except Exception as error:
-            messages.put(("error", (error, traceback.format_exc())))
+            messages.put(("error", error))
 
     def poll() -> None:
         try:
@@ -87,9 +86,7 @@ def launch_gui(example_limit: int = 5) -> int:
                     return
                 elif kind == "error":
                     progress_bar.stop()
-                    error, details = payload  # type: ignore[misc]
-                    print(details)
-                    messagebox.showerror("Ошибка", str(error), parent=root)
+                    messagebox.showerror("Ошибка", str(payload), parent=root)
                     root.destroy()
                     return
         except queue.Empty:

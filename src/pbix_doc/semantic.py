@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -141,7 +142,14 @@ def load_semantic_model(
         )
         return empty_model("NO_MODEL")
     except Exception as error:
-        issues.append(Issue("ERROR", "MODEL", "MODEL_EXTRACTION_FAILED", str(error)))
+        issues.append(
+            Issue(
+                "ERROR",
+                "MODEL",
+                "MODEL_EXTRACTION_FAILED",
+                safe_error_message(error, pbix_path, temp_dir),
+            )
+        )
         return empty_model("FAILED")
 
 
@@ -386,3 +394,11 @@ def text_or_none(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def safe_error_message(error: Exception, *paths: Path | None) -> str:
+    message = " ".join(str(error).splitlines())
+    for path in paths:
+        if path:
+            message = re.sub(re.escape(str(path)), "<LOCAL_PATH>", message, flags=re.IGNORECASE)
+    return message

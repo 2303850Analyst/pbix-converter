@@ -1,12 +1,12 @@
 # PBIX Documentation CLI — locked architecture baseline
 
-Status: **approved and locked**  
-Baseline version: **1.1**  
+Status: **approved and locked**
+Baseline version: **1.2**
 Change rule: this document changes only after explicit user approval.
 
 ## 1. Product contract
 
-The program is a local Python CLI application developed in PyCharm.
+The program is a Python application developed in PyCharm and executed inside a corporate Citrix VDI Windows session.
 
 ```text
 Input:  exactly one Power BI report in .pbix format
@@ -15,7 +15,7 @@ Output: exactly one human-readable .txt documentation file
 
 Runtime requirements:
 
-- local processing only;
+- offline processing inside the VDI trust boundary;
 - no Power BI Service or Fabric API;
 - no external LLM;
 - no network requirement;
@@ -24,10 +24,31 @@ Runtime requirements:
 - no persistent extraction folders, JSON dumps, CSV files, or table rows;
 - local temporary files are allowed and removed after processing.
 
+### 1.1 VDI_OFFLINE_RUNTIME policy
+
+"Local" means inside the remote Windows session, not on the user's physical endpoint. The browser and Citrix Workspace provide access to the VDI desktop; the application process and PBIX processing run in that Windows environment.
+
+The application:
+
+- accepts only paths explicitly selected by the user in the VDI Explorer or passed to the CLI;
+- does not impose hard-coded drive, root-folder, UNC, mapped-drive, or reparse-point restrictions;
+- may use any corporate filesystem location exposed and authorized by the VDI environment;
+- does not create HTTP endpoints, make HTTP requests, open sockets, send webhooks, use telemetry, invoke cloud APIs, or launch external processes;
+- does not invoke Git, package managers, browsers, Yandex Disk, or other sync clients at runtime;
+- installs an in-process audit guard before PBIX analysis to reject Python socket operations and external-process launches;
+- produces no permanent logs and does not include the absolute source path in the TXT;
+- creates its extraction workspace beside the user-selected output, removes it normally, and removes abandoned application-owned workspaces on a later run;
+- keeps the atomic output temporary file beside the final TXT.
+
+Citrix clipboard, client-drive, USB, printing, session recording, and network policies are controlled by VDI administrators and are outside the Python application's authority. Operating-system egress controls remain the outer enforcement layer; the application guard is defense in depth.
+
+Development may use Git and synchronized development folders, but real corporate PBIX files must not be processed there. A VDI production release contains application wheels, pinned dependency wheels, checksums, and offline scripts only; it contains no `.git` directory and performs no package download during installation or execution.
+
 ## 2. Processing pipeline
 
 ```text
 CLI / Controller
+    -> VDI Offline Runtime Guard
     -> Preflight Validator
     -> PBIX Container Reader
        -> Report Format Detector
@@ -56,6 +77,8 @@ The preflight layer verifies:
 - duplicate or suspicious archive members;
 - configured size and decompression limits;
 - protected, encrypted, corrupt, or unsupported input state.
+
+Input and output paths are user-controlled and are not limited to named disks or directories. This is intentional because the VDI may expose local profile storage, mapped corporate drives, or approved network folders. The application never scans unrelated locations and never chooses an external destination itself.
 
 The container is opened read-only. Member paths are normalized for separators and comparison while original names are retained for evidence paths.
 
@@ -143,7 +166,7 @@ Continuous numeric values:      hidden
 Identifiers and keys:           hidden
 Categorical examples:           maximum five
 Connection secrets:             removed
-DAX definitions:                included as code
+DAX definitions:                included as explicitly approved metadata code
 Power Query definitions:        included only after sanitization
 ```
 
@@ -315,7 +338,7 @@ Diagnostics describe extraction quality, not Power BI business results. They inc
 - critical read or write errors;
 - application and dependency versions.
 
-Diagnostics are printed to the console and included in the final TXT. No permanent log file is created by default.
+Diagnostics are printed to the console and included in the final TXT. No permanent log file is created by default. GUI and CLI errors contain a concise message without a traceback. Evidence paths in the TXT refer only to internal PBIX members, not to absolute Windows paths.
 
 ## 13. Output structure
 
@@ -347,6 +370,8 @@ N+4. Diagnostics
 
 The file is written as UTF-8 with BOM and Windows CRLF line endings. The writer uses a same-directory temporary file followed by atomic replacement where the filesystem supports it.
 
+The file-information section contains the PBIX filename, size, modification time, and SHA-256. It does not contain the absolute input path.
+
 ## 14. Exit behavior
 
 ```text
@@ -364,21 +389,22 @@ Partial output is preferred whenever at least one meaningful subsystem succeeded
 src/pbix_doc/
 ├── __main__.py
 ├── cli.py
-├── application.py
-├── config.py
-├── errors.py
-├── container/
-├── report/
-├── model/
-├── domain/
-├── processing/
-└── output/
+├── gui.py
+├── pipeline.py
+├── runtime.py
+├── container.py
+├── report.py
+├── semantic.py
+├── domain.py
+└── renderer.py
 
 tests/
-├── unit/
-├── integration/
-├── fixtures/
-└── golden/
+└── test_converter.py
+
+scripts/
+├── build_offline_release.ps1
+├── install_offline.ps1
+└── run_pbix_doc.ps1
 ```
 
-The production dependency baseline is a pinned PBIXRay release plus `tabulate`. Tests use `pytest`, coverage, static analysis, and golden TXT comparisons.
+The direct production dependency is pinned in `pyproject.toml`; the complete tested transitive set and permitted wheel hashes are pinned in `requirements.lock` for Windows x64 and CPython 3.11–3.13. The build backend is separately pinned by version and hash in `requirements-build.lock`. The release builder downloads only hash-matching binary wheels on a separate build machine, builds the application wheel in an isolated environment, and emits `SHA256SUMS`. VDI installation verifies the manifest and uses pip with `--no-index` and the bundled wheelhouse.

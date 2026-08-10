@@ -1,25 +1,40 @@
 from __future__ import annotations
 
+import ast
 import codecs
+import contextlib
+import io
 import json
+import os
+import sys
 import tempfile
 import unittest
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from pbix_doc.container import PbixContainer, UnsupportedPbixError
 from pbix_doc.domain import (
     ColumnInfo,
     DocumentationModel,
     FileInfo,
+    MeasureInfo,
     SemanticModelInfo,
     TableInfo,
 )
+from pbix_doc.cli import build_parser, main
 from pbix_doc.pipeline import Options, generate_documentation, resolve_fields
 from pbix_doc.renderer import atomic_write, render_document
 from pbix_doc.report import parse_report
-from pbix_doc.semantic import profile_examples
+from pbix_doc.runtime import (
+    WORKSPACE_MARKER,
+    WORKSPACE_PREFIX,
+    OfflineRuntimeViolation,
+    cleanup_stale_artifacts,
+    install_offline_guard,
+)
+from pbix_doc.semantic import profile_examples, safe_error_message
 
 
 def write_zip(path: Path, parts: dict[str, object]) -> None:
@@ -214,6 +229,16 @@ class RendererTests(unittest.TestCase):
                         ],
                     )
                 ],
+                measures=[
+                    MeasureInfo(
+                        "Sales",
+                        "Selected region",
+                        'CALCULATE([Revenue], Sales[Region] = "North")',
+                        None,
+                        None,
+                        None,
+                    )
+                ],
             )
             resolve_fields(report.pages, semantic, issues)
             model = DocumentationModel(
@@ -232,6 +257,9 @@ class RendererTests(unittest.TestCase):
         self.assertIn("<VALUES HIDDEN>", text)
         self.assertNotIn("Секретный регион", text)
         self.assertNotIn("Никогда не печатать", text)
+        self.assertNotIn(str(path.resolve()), text)
+        self.assertIn("Источник: выбранный файл в защищённой среде VDI", text)
+        self.assertIn('Sales[Region] = "North"', text)
         self.assertEqual(sum(value in text for value in ["Центр", "Север", "Юг", "Запад", "Восток"]), 5)
 
     def test_atomic_writer_uses_utf8_bom_and_crlf(self) -> None:
@@ -257,6 +285,79 @@ class PipelineTests(unittest.TestCase):
         self.assertNotEqual(model.semantic_model.status, "EMBEDDED")
         self.assertIn("ИТОГОВЫЙ СТАТУС: PARTIAL", text)
         self.assertNotIn("Секретный регион", text)
+
+    def test_workspace_is_created_beside_output_and_removed(self) -> None:
+        observed: list[Path] = []
+
+        def fake_model(_: Path, workspace: Path, example_limit: int, __: list) -> SemanticModelInfo:
+            observed.append(workspace)
+            self.assertEqual(workspace.parent, output_path.parent)
+            self.assertTrue(workspace.joinpath(WORKSPACE_MARKER).is_file())
+            self.assertEqual(example_limit, 5)
+            return SemanticModelInfo("NO_MODEL")
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory, "fixture.pbix")
+            output_path = Path(directory, "result.txt")
+            write_zip(input_path, pbir_parts())
+            with patch("pbix_doc.pipeline.load_semantic_model", side_effect=fake_model):
+                generate_documentation(input_path, output_path, Options(example_limit=100))
+            remaining = list(Path(directory).glob(f"{WORKSPACE_PREFIX}*"))
+
+        self.assertEqual(len(observed), 1)
+        self.assertFalse(observed[0].exists())
+        self.assertFalse(remaining)
+
+
+class RuntimePolicyTests(unittest.TestCase):
+    def test_stale_owned_workspace_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            stale = parent.joinpath(f"{WORKSPACE_PREFIX}stale")
+            stale.mkdir()
+            stale.joinpath(WORKSPACE_MARKER).write_text(
+                json.dumps({"application": "pbix-doc", "pid": 2_000_000_000}),
+                encoding="ascii",
+            )
+            stale.joinpath("data.pbixray").write_bytes(b"temporary")
+            cleanup_stale_artifacts(parent)
+            self.assertFalse(stale.exists())
+
+    def test_runtime_guard_blocks_network_and_external_processes(self) -> None:
+        install_offline_guard()
+        for event in ("socket.__new__", "socket.connect", "socket.sendto", "subprocess.Popen", "os.system"):
+            with self.subTest(event=event), self.assertRaises(OfflineRuntimeViolation):
+                sys.audit(event)
+
+    def test_application_source_has_no_network_or_process_imports(self) -> None:
+        forbidden = {"git", "http", "requests", "socket", "subprocess", "urllib", "webbrowser"}
+        source_root = Path(__file__).parents[1].joinpath("src", "pbix_doc")
+        imports: set[str] = set()
+        for path in source_root.glob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imports.update(alias.name.partition(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imports.add(node.module.partition(".")[0])
+        self.assertFalse(imports & forbidden)
+
+    def test_cli_has_no_temp_directory_override(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            build_parser().parse_args(["input.pbix", "output.txt", "--temp-dir", os.curdir])
+
+    def test_cli_reports_compact_error_without_traceback(self) -> None:
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            exit_code = main(["missing.pbix", "output.txt"])
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Ошибка:", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_dependency_error_redacts_local_paths(self) -> None:
+        sensitive_path = Path(r"C:\Corporate\Reports\secret.pbix")
+        message = safe_error_message(RuntimeError(f"Cannot open {sensitive_path}"), sensitive_path)
+        self.assertEqual(message, "Cannot open <LOCAL_PATH>")
 
 
 class ProfilerTests(unittest.TestCase):

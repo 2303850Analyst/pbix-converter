@@ -4,5 +4,6 @@ __pycache__/
 .idea/
 .pytest_cache/
 .venv/
+.gstack/
 dist/
 build/

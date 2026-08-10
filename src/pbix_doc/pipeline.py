@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,23 +11,27 @@ from . import __version__
 from .container import PbixContainer
 from .domain import DocumentationModel, FileInfo, Issue, SemanticModelInfo
 from .report import parse_report
+from .runtime import install_offline_guard, managed_workspace
 from .semantic import load_semantic_model
 
 
 ProgressCallback = Callable[[str], None]
+MAX_EXAMPLE_VALUES = 5
 
 
 @dataclass(slots=True)
 class Options:
     example_limit: int = 5
-    temp_dir: Path | None = None
 
 
 def analyze_pbix(
     input_path: Path,
     options: Options | None = None,
     progress: ProgressCallback | None = None,
+    *,
+    workspace_parent: Path | None = None,
 ) -> DocumentationModel:
+    install_offline_guard()
     options = options or Options()
     input_path = input_path.resolve()
     if input_path.suffix.casefold() != ".pbix":
@@ -52,14 +55,12 @@ def analyze_pbix(
         report = parse_report(container, input_path.stem, issues)
 
     notify("Чтение семантической модели")
-    configured_temp = options.temp_dir.resolve() if options.temp_dir else None
-    if configured_temp:
-        configured_temp.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="pbix_doc_", dir=configured_temp) as temp_path:
+    workspace_parent = (workspace_parent or input_path.parent).resolve()
+    with managed_workspace(workspace_parent) as temp_path:
         semantic = load_semantic_model(
             input_path,
-            Path(temp_path),
-            max(0, options.example_limit),
+            temp_path,
+            min(MAX_EXAMPLE_VALUES, max(0, options.example_limit)),
             issues,
         )
 
@@ -85,9 +86,20 @@ def generate_documentation(
 ) -> DocumentationModel:
     from .renderer import atomic_write, render_document
 
-    if input_path.resolve() == output_path.resolve():
+    input_path = input_path.resolve()
+    output_path = output_path.resolve()
+    if input_path == output_path:
         raise ValueError("Входной и выходной пути не должны совпадать")
-    model = analyze_pbix(input_path, options, progress)
+    if output_path.suffix.casefold() != ".txt":
+        raise ValueError("Выходной файл должен иметь расширение .txt")
+    if not output_path.parent.is_dir():
+        raise FileNotFoundError(output_path.parent)
+    model = analyze_pbix(
+        input_path,
+        options,
+        progress,
+        workspace_parent=output_path.parent,
+    )
     if progress:
         progress("Запись TXT")
     atomic_write(output_path, render_document(model))
