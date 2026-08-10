@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter, defaultdict
 from importlib.metadata import PackageNotFoundError, version
@@ -38,6 +39,53 @@ SENSITIVE_NAME_PARTS = (
     "парол",
     "токен",
 )
+
+SUMMARIZE_BY_CODES = {
+    1: "По умолчанию",
+    2: "БЕЗ АГРЕГАЦИИ",
+    3: "SUM",
+    4: "MIN",
+    5: "MAX",
+    6: "COUNT",
+    7: "AVERAGE",
+    8: "DISTINCT_COUNT",
+}
+
+SUMMARIZE_BY_NAMES = {
+    "default": "По умолчанию",
+    "none": "БЕЗ АГРЕГАЦИИ",
+    "donotsummarize": "БЕЗ АГРЕГАЦИИ",
+    "sum": "SUM",
+    "min": "MIN",
+    "max": "MAX",
+    "count": "COUNT",
+    "average": "AVERAGE",
+    "avg": "AVERAGE",
+    "distinctcount": "DISTINCT_COUNT",
+}
+
+
+def normalize_summarize_by(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    normalized: Any = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if re.fullmatch(r"[+-]?\d+", text):
+            normalized = int(text)
+        else:
+            key = re.sub(r"[^a-z]", "", text.casefold())
+            return SUMMARIZE_BY_NAMES.get(key, text)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value.is_integer():
+            normalized = int(value)
+    if isinstance(normalized, int):
+        return SUMMARIZE_BY_CODES.get(normalized, f"НЕИЗВЕСТНЫЙ КОД ({normalized})")
+    return str(normalized).strip() or None
 
 
 def records(value: Any) -> list[dict[str, Any]]:
@@ -213,7 +261,9 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
                 format_string=text_or_none(rget(row, "FormatString", "Format")),
                 source_column=source_column,
                 native_data_type=native_type,
-                summarize_by=text_or_none(rget(row, "SummarizeBy", "DefaultSummarization")),
+                summarize_by=normalize_summarize_by(
+                    rget(row, "SummarizeBy", "DefaultSummarization")
+                ),
             )
         )
 

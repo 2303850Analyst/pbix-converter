@@ -5,6 +5,7 @@ import codecs
 import contextlib
 import io
 import json
+import math
 import os
 import socket
 import subprocess
@@ -35,7 +36,7 @@ from pbix_doc.pipeline import Options, generate_documentation, resolve_fields
 from pbix_doc.ooxml import UnsafeDocxError, validate_docx
 from pbix_doc.projector import HeadingBlock, SafeDocumentModel, TableBlock, project_document, sanitize_dax
 from pbix_doc.renderer import atomic_write, render_document
-from pbix_doc.report import parse_report
+from pbix_doc.report import aggregation_name, parse_report
 from pbix_doc.runtime import (
     WORKSPACE_MARKER,
     WORKSPACE_PREFIX,
@@ -51,6 +52,7 @@ from pbix_doc.semantic import (
     profile_examples,
     read_model_metadata,
     safe_error_message,
+    normalize_summarize_by,
 )
 
 
@@ -266,6 +268,29 @@ class ReportParserTests(unittest.TestCase):
         self.assertEqual(report.bookmarks[0].trigger_refs, ["Детали / Вернуть обзор"])
         self.assertFalse(issues)
 
+    def test_aggregation_codes_are_rendered_as_names(self) -> None:
+        expected = {
+            0: "SUM",
+            1: "AVERAGE",
+            2: "COUNT",
+            3: "MIN",
+            4: "MAX",
+            5: "COUNT_NON_NULL",
+            6: "MEDIAN",
+            7: "STANDARD_DEVIATION",
+            8: "VARIANCE",
+        }
+        for code, name in expected.items():
+            with self.subTest(code=code):
+                self.assertEqual(aggregation_name(code), name)
+                self.assertEqual(aggregation_name(str(code)), name)
+        self.assertEqual(aggregation_name(2.0), "COUNT")
+        self.assertEqual(aggregation_name("Average"), "AVERAGE")
+        self.assertEqual(aggregation_name(None), "АГРЕГАЦИЯ НЕ УКАЗАНА")
+        self.assertEqual(aggregation_name(math.nan), "АГРЕГАЦИЯ НЕ УКАЗАНА")
+        self.assertEqual(aggregation_name(math.inf), "АГРЕГАЦИЯ НЕ УКАЗАНА")
+        self.assertEqual(aggregation_name(99), "НЕИЗВЕСТНАЯ АГРЕГАЦИЯ (код: 99)")
+
     def test_legacy_utf16_layout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "legacy.pbix")
@@ -315,7 +340,7 @@ class RendererTests(unittest.TestCase):
                                 format_string="Text",
                                 source_column="region_code",
                                 native_data_type="SQL: varchar(20); M: type text",
-                                summarize_by="DoNotSummarize",
+                                summarize_by="БЕЗ АГРЕГАЦИИ",
                             ),
                             ColumnInfo(
                                 "Sales",
@@ -333,8 +358,22 @@ class RendererTests(unittest.TestCase):
                                 2,
                                 example_status="NOT_PROFILED",
                             ),
+                            ColumnInfo(
+                                "Sales",
+                                "CalculatedAmount",
+                                "Decimal",
+                                False,
+                                None,
+                                expression="Sales[Amount] * 2",
+                            ),
                         ],
-                    )
+                    ),
+                    TableInfo(
+                        "LocalDateTable_123",
+                        True,
+                        "Import",
+                        [ColumnInfo("LocalDateTable_123", "Date", "DateTime", True, 365)],
+                    ),
                 ],
                 measures=[
                     MeasureInfo(
@@ -365,8 +404,8 @@ class RendererTests(unittest.TestCase):
         self.assertIn("РАЗЛИЧИЕ ОПРЕДЕЛЕНИЙ", text)
         self.assertIn("Каталог KPI и вычислений", text)
         self.assertIn("Реестр полей отчёта", text)
-        self.assertIn("Варианты названий / обозначений в отчёте", text)
-        self.assertIn("Наименование из NativeQuery при импорте", text)
+        self.assertIn("Варианты названий", text)
+        self.assertIn("Наименование в источнике", text)
         self.assertIn("Sales[Region]", text)
         self.assertIn("region_code", text)
         self.assertIn("SQL: varchar(20); M: type text", text)
@@ -384,14 +423,40 @@ class RendererTests(unittest.TestCase):
         document = Document(BytesIO(payload))
         table_headers = [tuple(cell.text for cell in table.rows[0].cells) for table in document.tables]
         filter_index = next(index for index, row in enumerate(table_headers) if row[0] == "Область")
-        registry_index = next(index for index, row in enumerate(table_headers) if row[0] == "Таблица[поле]")
+        registry_index = next(index for index, row in enumerate(table_headers) if row[0] == "Таблица[Поле]")
         registry = document.tables[registry_index]
         registry_rows = {row.cells[0].text: row for row in registry.rows[1:]}
         self.assertEqual(registry_index, filter_index + 1)
         self.assertEqual(len(registry.columns), 11)
+        self.assertEqual(
+            table_headers[registry_index],
+            (
+                "Таблица[Поле]",
+                "Варианты названий",
+                "Тип данных в PBI",
+                "Объяснение",
+                "DAX",
+                "Упоминается на листе",
+                "Наименование в источнике",
+                "Тип данных в источнике",
+                "Используется в DAX",
+                "Используется в визуалах",
+                "Варианты агрегаций",
+            ),
+        )
         self.assertTrue(all(row.cells[3].text == "" for row in registry.rows[1:]))
+        self.assertFalse(any(name.casefold().startswith("local") for name in registry_rows))
+        self.assertEqual(registry_rows["Sales[Region]"].cells[2].text, "String")
+        self.assertEqual(registry_rows["Sales[UnusedFlag]"].cells[4].text, "—")
         self.assertIn("Sales[UnusedFlag]", registry_rows)
         self.assertEqual(registry_rows["Sales[UnusedFlag]"].cells[9].text, "—")
+        self.assertTrue(registry_rows["Sales[UnusedFlag]"].cells[6].text.startswith("NOT_AVAILABLE:"))
+        self.assertTrue(registry_rows["Sales[UnusedFlag]"].cells[7].text.startswith("NOT_AVAILABLE:"))
+        self.assertTrue(registry_rows["Sales[Selected region]"].cells[6].text.startswith("Не применимо:"))
+        self.assertTrue(registry_rows["Sales[Selected region]"].cells[7].text.startswith("Не применимо:"))
+        self.assertTrue(registry_rows["Sales[CalculatedAmount]"].cells[6].text.startswith("Не применимо:"))
+        self.assertTrue(registry_rows["Sales[CalculatedAmount]"].cells[7].text.startswith("Не применимо:"))
+        self.assertNotEqual(registry_rows["Sales[CalculatedAmount]"].cells[4].text, "—")
         self.assertIn("Sales[Selected region]", registry_rows["Sales[Region]"].cells[8].text)
         self.assertIn("SUM —", registry_rows["Sales[Amount]"].cells[10].text)
         self.assertTrue(any(section.orientation == WD_ORIENT.LANDSCAPE for section in document.sections))
@@ -656,6 +721,28 @@ class ProfilerTests(unittest.TestCase):
 
 
 class SemanticAdapterTests(unittest.TestCase):
+    def test_summarize_by_codes_are_normalized_without_bare_numbers(self) -> None:
+        expected = {
+            1: "По умолчанию",
+            2: "БЕЗ АГРЕГАЦИИ",
+            3: "SUM",
+            4: "MIN",
+            5: "MAX",
+            6: "COUNT",
+            7: "AVERAGE",
+            8: "DISTINCT_COUNT",
+        }
+        for code, name in expected.items():
+            with self.subTest(code=code):
+                self.assertEqual(normalize_summarize_by(code), name)
+                self.assertEqual(normalize_summarize_by(str(code)), name)
+        self.assertEqual(normalize_summarize_by(3.0), "SUM")
+        self.assertEqual(normalize_summarize_by("DoNotSummarize"), "БЕЗ АГРЕГАЦИИ")
+        self.assertEqual(normalize_summarize_by(99), "НЕИЗВЕСТНЫЙ КОД (99)")
+        self.assertIsNone(normalize_summarize_by(""))
+        self.assertIsNone(normalize_summarize_by(math.nan))
+        self.assertIsNone(normalize_summarize_by(math.inf))
+
     def test_native_query_names_and_types_are_normalized_without_retaining_query(self) -> None:
         class FakeModel:
             tmschema_tables = [{"Name": "Sales", "IsHidden": False, "StorageMode": "Import"}]
@@ -666,7 +753,7 @@ class SemanticAdapterTests(unittest.TestCase):
                     "DataType": "Decimal",
                     "FormatString": "#,0.00",
                     "SourceColumn": "amount_net",
-                    "SummarizeBy": "Sum",
+                    "SummarizeBy": 3,
                 }
             ]
             schema = [{"TableName": "Sales", "ColumnName": "Amount", "SemanticType": "Decimal"}]
@@ -697,7 +784,7 @@ class SemanticAdapterTests(unittest.TestCase):
         self.assertEqual(column.format_string, "#,0.00")
         self.assertEqual(column.source_column, "amount_net")
         self.assertEqual(column.native_data_type, "SQL: decimal(18,2); M: Currency.Type")
-        self.assertEqual(column.summarize_by, "Sum")
+        self.assertEqual(column.summarize_by, "SUM")
         self.assertNotIn("server", repr(semantic))
         self.assertNotIn("SELECT CAST", repr(semantic))
         self.assertFalse(issues)

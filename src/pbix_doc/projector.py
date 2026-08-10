@@ -358,37 +358,26 @@ def _field_registry(
 
     rows: list[tuple[str, ...]] = []
     ordered = sorted(
-        entries.values(),
+        (entry for entry in entries.values() if not entry.table.casefold().startswith("local")),
         key=lambda item: (item.table.casefold(), item.name.casefold(), item.object_type),
     )
     for entry in ordered[:MAX_FIELD_REGISTRY_ROWS]:
         dax = sanitize_dax(entry.dax_expression)
         dax_text = dax.text or (dax.reason if entry.dax_expression else "—")
-        model_format = [
-            f"Объект: {'мера' if entry.object_type == 'MEASURE' else 'поле'}",
-            f"Тип: {clean_text(entry.data_type or 'NOT_AVAILABLE')}",
-        ]
-        if entry.format_string:
-            model_format.append(f"Отображение: {clean_text(entry.format_string)}")
         aggregations = set(entry.aggregations)
         if entry.summarize_by:
-            aggregations.add(f"По умолчанию в модели: {clean_text(entry.summarize_by)}")
-        native_name = "не применимо" if entry.object_type == "MEASURE" else clean_text(
-            entry.source_column or "NOT_AVAILABLE"
-        )
-        native_type = "не применимо" if entry.object_type == "MEASURE" else clean_text(
-            entry.native_data_type or "NOT_AVAILABLE"
-        )
+            value = clean_text(entry.summarize_by)
+            aggregations.add("По умолчанию" if value == "По умолчанию" else f"По умолчанию: {value}")
         rows.append(
             (
                 f"{clean_text(entry.table)}[{clean_text(entry.name)}]",
                 _joined(entry.aliases),
-                "; ".join(model_format),
+                clean_text(entry.data_type or "NOT_AVAILABLE"),
                 "",
                 clean_text(dax_text, preserve_newlines=True, limit=MAX_DAX_CHARS + len(OVERFLOW)),
                 _joined(entry.pages),
-                native_name,
-                native_type,
+                _source_name(entry),
+                _source_type(entry),
                 _joined(entry.dax_usages),
                 _joined(entry.visuals),
                 _joined(aggregations),
@@ -411,20 +400,20 @@ def _field_registry(
         blocks.append(
             TableBlock(
                 (
-                    "Таблица[поле]",
-                    "Варианты названий / обозначений в отчёте",
-                    "Формат данных в Power BI и формат отображения",
-                    "Объяснение (заполняется разработчиком)",
-                    "Выражение DAX (если применимо)",
-                    "Листы, где применяется",
-                    "Наименование из NativeQuery при импорте",
-                    "Формат данных из NativeQuery",
-                    "В каких DAX-формулах применяется",
-                    "В каких визуалах применяется",
-                    "Все агрегации и места применения",
+                    "Таблица[Поле]",
+                    "Варианты названий",
+                    "Тип данных в PBI",
+                    "Объяснение",
+                    "DAX",
+                    "Упоминается на листе",
+                    "Наименование в источнике",
+                    "Тип данных в источнике",
+                    "Используется в DAX",
+                    "Используется в визуалах",
+                    "Варианты агрегаций",
                 ),
                 rows,
-                (1_400, 1_400, 1_200, 1_100, 1_750, 1_050, 1_100, 1_100, 1_300, 1_500, 1_500),
+                (1_250, 1_250, 900, 1_050, 1_600, 1_100, 1_450, 1_450, 1_200, 1_500, 1_650),
                 font_size=7.2,
                 allow_row_split=True,
             )
@@ -433,6 +422,26 @@ def _field_registry(
         blocks.append(ParagraphBlock("Поля в доступной локальной метадате не найдены.", "warning"))
     blocks.append(SectionBreakBlock("portrait"))
     return blocks
+
+
+def _source_name(entry: FieldRegistryEntry) -> str:
+    if entry.object_type == "MEASURE":
+        return "Не применимо: мера вычисляется в модели и не имеет исходной колонки"
+    if entry.source_column:
+        return clean_text(entry.source_column)
+    if entry.dax_expression:
+        return "Не применимо: вычисляемый столбец создаётся в модели"
+    return "NOT_AVAILABLE: имя исходной колонки отсутствует в локальной метадате PBIX"
+
+
+def _source_type(entry: FieldRegistryEntry) -> str:
+    if entry.object_type == "MEASURE":
+        return "Не применимо: тип результата меры задаётся моделью"
+    if entry.native_data_type:
+        return clean_text(entry.native_data_type)
+    if entry.dax_expression and not entry.source_column:
+        return "Не применимо: вычисляемый столбец типизируется в модели"
+    return "NOT_AVAILABLE: тип исходной колонки отсутствует в локальной метадате PBIX"
 
 
 def _qualified_parts(value: str) -> tuple[str, str] | None:

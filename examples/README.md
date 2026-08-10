@@ -18,4 +18,4 @@ python main.py examples\synthetic_representative.pbix examples\synthetic_represe
 ```
 
 `synthetic_representative_documentation.docx` is the reviewed golden example intended for manual import into Atlassian Confluence Data Center.
-Its field registry is populated from the report bindings. NativeQuery and model-format cells are marked `NOT_AVAILABLE` because this synthetic fixture intentionally has no embedded `DataModel`.
+Its field registry is populated from the report bindings and demonstrates both `SUM` and `COUNT`. PBI type and source cells explain `NOT_AVAILABLE` because this synthetic fixture intentionally has no embedded `DataModel`.

@@ -27,7 +27,7 @@ def field(kind: str, table: str, name: str) -> dict[str, Any]:
     }
 
 
-def aggregation(table: str, name: str, function: int = 0) -> dict[str, Any]:
+def aggregation(table: str, name: str, function: int | str = 0) -> dict[str, Any]:
     return {"Aggregation": {"Expression": field("Column", table, name), "Function": function}}
 
 
@@ -201,7 +201,10 @@ def parts() -> dict[str, Any]:
             {
                 "Rows": [projection("Product.Category", field("Column", "Product", "Category"))],
                 "Columns": [projection("Calendar.Year", field("Column", "Calendar", "Year"))],
-                "Values": [projection("Sales.Total Revenue", field("Measure", "Sales", "Total Revenue"))],
+                "Values": [
+                    projection("Sales.Total Revenue", field("Measure", "Sales", "Total Revenue")),
+                    projection("Count(Sales.Amount)", aggregation("Sales", "Amount", "2")),
+                ],
             },
         ),
         "custom_gauge": visual(

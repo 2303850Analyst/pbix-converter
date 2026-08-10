@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterable, Iterator
 from pathlib import PurePosixPath
@@ -44,6 +45,42 @@ AGGREGATIONS = {
     7: "STANDARD_DEVIATION",
     8: "VARIANCE",
 }
+
+AGGREGATION_NAMES = {
+    "sum": "SUM",
+    "average": "AVERAGE",
+    "avg": "AVERAGE",
+    "count": "COUNT",
+    "min": "MIN",
+    "max": "MAX",
+    "countnonnull": "COUNT_NON_NULL",
+    "count_non_null": "COUNT_NON_NULL",
+    "median": "MEDIAN",
+    "standarddeviation": "STANDARD_DEVIATION",
+    "standard_deviation": "STANDARD_DEVIATION",
+    "variance": "VARIANCE",
+}
+
+
+def aggregation_name(value: Any) -> str:
+    normalized: Any = value
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+-]?\d+", text):
+            normalized = int(text)
+        else:
+            named = AGGREGATION_NAMES.get(text.casefold())
+            if named:
+                return named
+            return text or "АГРЕГАЦИЯ НЕ УКАЗАНА"
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            return "АГРЕГАЦИЯ НЕ УКАЗАНА"
+        if value.is_integer():
+            normalized = int(value)
+    if isinstance(normalized, int) and not isinstance(normalized, bool):
+        return AGGREGATIONS.get(normalized, f"НЕИЗВЕСТНАЯ АГРЕГАЦИЯ (код: {normalized})")
+    return "АГРЕГАЦИЯ НЕ УКАЗАНА" if normalized is None else str(normalized)
 
 
 def decode_nested_json(value: Any, depth: int = 0) -> Any:
@@ -193,7 +230,7 @@ def field_from_expression(
             function = aggregation.get("Function")
             if function is None:
                 function = aggregation.get("function")
-            result.aggregation = AGGREGATIONS.get(function, str(function) if function is not None else "AGGREGATION")
+            result.aggregation = aggregation_name(function)
             return result
 
     for value in expression.values():

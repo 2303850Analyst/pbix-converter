@@ -234,20 +234,20 @@ Each normalized semantic column may additionally retain `format_string`, `source
 The field registry is mandatory and appears immediately after `Фильтры уровня отчёта`. Its columns are fixed:
 
 ```text
-Таблица[поле]
-Варианты названий / обозначений в отчёте
-Формат данных в Power BI и формат отображения
-Объяснение (пустая ячейка для ручного заполнения разработчиком)
-Выражение DAX (если применимо)
-Листы, где применяется
-Наименование из NativeQuery при импорте
-Формат данных из NativeQuery
-В каких DAX-формулах применяется
-В каких визуалах применяется
-Все агрегации и места применения
+Таблица[Поле]
+Варианты названий
+Тип данных в PBI
+Объяснение
+DAX
+Упоминается на листе
+Наименование в источнике
+Тип данных в источнике
+Используется в DAX
+Используется в визуалах
+Варианты агрегаций
 ```
 
-The registry includes model objects even when they are unused by a visual. Visual references use the document-local page and visual IDs. DAX expressions use the normal token-aware sanitization policy, and the dependency column lists formula object names rather than evaluated results. The explanation column is intentionally empty and is never populated automatically.
+The first header is rendered as `Таблица[Поле]`. The registry includes model objects even when they are unused by a visual, except rows whose first-cell value starts with `Local` (Power BI local helper tables). The PBI type cell contains only the normalized type value, without object-kind or display-format prefixes. Visual references use the document-local page and visual IDs. DAX expressions use the normal token-aware sanitization policy, and the dependency column lists formula object names rather than evaluated results. The explanation column is intentionally empty and is never populated automatically. Missing source metadata is not a bare marker: the source-name and source-type cells explain why the value is `Не применимо` or `NOT_AVAILABLE`. Numeric aggregation enums are normalized to names such as `По умолчанию`, `SUM`, `COUNT`, or `БЕЗ АГРЕГАЦИИ`; bare enum numbers are not user-facing output.
 
 The comparison taxonomy is fixed:
 
