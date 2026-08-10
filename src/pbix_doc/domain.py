@@ -138,6 +138,10 @@ class ColumnInfo:
     expression: str | None = None
     examples: list[str] = field(default_factory=list)
     example_status: str = "NOT_PROFILED"
+    format_string: str | None = None
+    source_column: str | None = None
+    native_data_type: str | None = None
+    summarize_by: str | None = None
 
 
 @dataclass(slots=True)
@@ -156,6 +160,7 @@ class MeasureInfo:
     format_string: str | None
     display_folder: str | None
     description: str | None
+    data_type: str | None = None
 
 
 @dataclass(slots=True)

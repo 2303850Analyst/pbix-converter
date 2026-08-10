@@ -190,7 +190,9 @@ def field_from_expression(
         nested = aggregation.get("Expression") or aggregation.get("expression") or aggregation
         result = field_from_expression(nested, aliases, role, usage, source_path, query_ref)
         if result:
-            function = aggregation.get("Function") or aggregation.get("function")
+            function = aggregation.get("Function")
+            if function is None:
+                function = aggregation.get("function")
             result.aggregation = AGGREGATIONS.get(function, str(function) if function is not None else "AGGREGATION")
             return result
 

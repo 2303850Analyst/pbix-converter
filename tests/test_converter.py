@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docx import Document
+from docx.enum.section import WD_ORIENT
 
 from pbix_doc.container import PbixContainer, UnsupportedPbixError
 from pbix_doc.domain import (
@@ -43,7 +44,7 @@ from pbix_doc.runtime import (
     cleanup_stale_artifacts,
     install_runtime_guards,
 )
-from pbix_doc.semantic import load_semantic_model, profile_examples, safe_error_message
+from pbix_doc.semantic import load_semantic_model, profile_examples, read_model_metadata, safe_error_message
 
 
 def read_docx_text(payload: bytes | Path) -> str:
@@ -304,6 +305,10 @@ class RendererTests(unittest.TestCase):
                                 5,
                                 examples=["Центр", "Север", "Юг", "Запад", "Восток"],
                                 example_status="PROFILED",
+                                format_string="Text",
+                                source_column="region_code",
+                                native_data_type="SQL: varchar(20); M: type text",
+                                summarize_by="DoNotSummarize",
                             ),
                             ColumnInfo(
                                 "Sales",
@@ -312,6 +317,14 @@ class RendererTests(unittest.TestCase):
                                 False,
                                 1000,
                                 example_status="NUMERIC_VALUES_HIDDEN",
+                            ),
+                            ColumnInfo(
+                                "Sales",
+                                "UnusedFlag",
+                                "Boolean",
+                                False,
+                                2,
+                                example_status="NOT_PROFILED",
                             ),
                         ],
                     )
@@ -344,6 +357,14 @@ class RendererTests(unittest.TestCase):
         self.assertIn("Одинаковое название — возможные различия", text)
         self.assertIn("РАЗЛИЧИЕ ОПРЕДЕЛЕНИЙ", text)
         self.assertIn("Каталог KPI и вычислений", text)
+        self.assertIn("Реестр полей отчёта", text)
+        self.assertIn("Варианты названий / обозначений в отчёте", text)
+        self.assertIn("Наименование из NativeQuery при импорте", text)
+        self.assertIn("Sales[Region]", text)
+        self.assertIn("region_code", text)
+        self.assertIn("SQL: varchar(20); M: type text", text)
+        self.assertIn("Sales[Selected region]", text)
+        self.assertIn("SUM —", text)
         self.assertIn("<VALUES HIDDEN>", text)
         self.assertNotIn("Секретный регион", text)
         self.assertNotIn("Другой секрет", text)
@@ -353,6 +374,20 @@ class RendererTests(unittest.TestCase):
         self.assertIn('Sales[Region] = "<VALUE>"', text)
         self.assertNotIn('"North"', text)
         self.assertEqual(sum(value in text for value in ["Центр", "Север", "Юг", "Запад", "Восток"]), 5)
+        document = Document(BytesIO(payload))
+        table_headers = [tuple(cell.text for cell in table.rows[0].cells) for table in document.tables]
+        filter_index = next(index for index, row in enumerate(table_headers) if row[0] == "Область")
+        registry_index = next(index for index, row in enumerate(table_headers) if row[0] == "Таблица[поле]")
+        registry = document.tables[registry_index]
+        registry_rows = {row.cells[0].text: row for row in registry.rows[1:]}
+        self.assertEqual(registry_index, filter_index + 1)
+        self.assertEqual(len(registry.columns), 11)
+        self.assertTrue(all(row.cells[3].text == "" for row in registry.rows[1:]))
+        self.assertIn("Sales[UnusedFlag]", registry_rows)
+        self.assertEqual(registry_rows["Sales[UnusedFlag]"].cells[9].text, "—")
+        self.assertIn("Sales[Selected region]", registry_rows["Sales[Region]"].cells[8].text)
+        self.assertIn("SUM —", registry_rows["Sales[Amount]"].cells[10].text)
+        self.assertTrue(any(section.orientation == WD_ORIENT.LANDSCAPE for section in document.sections))
         with zipfile.ZipFile(BytesIO(payload)) as archive:
             names = archive.namelist()
             relations = b"\n".join(
@@ -575,6 +610,54 @@ class ProfilerTests(unittest.TestCase):
         self.assertEqual(region.examples, ["A", "B", "C", "D", "E"])
         self.assertEqual(login.example_status, "IDENTIFIER_OR_HIDDEN")
         self.assertEqual(amount.example_status, "NUMERIC_VALUES_HIDDEN")
+        self.assertFalse(issues)
+
+
+class SemanticAdapterTests(unittest.TestCase):
+    def test_native_query_names_and_types_are_normalized_without_retaining_query(self) -> None:
+        class FakeModel:
+            tmschema_tables = [{"Name": "Sales", "IsHidden": False, "StorageMode": "Import"}]
+            tmschema_columns = [
+                {
+                    "TableName": "Sales",
+                    "Name": "Amount",
+                    "DataType": "Decimal",
+                    "FormatString": "#,0.00",
+                    "SourceColumn": "amount_net",
+                    "SummarizeBy": "Sum",
+                }
+            ]
+            schema = [{"TableName": "Sales", "ColumnName": "Amount", "SemanticType": "Decimal"}]
+            statistics = [{"TableName": "Sales", "ColumnName": "Amount", "Cardinality": 100}]
+            dax_columns: list[dict[str, object]] = []
+            tables: list[dict[str, object]] = []
+            dax_measures: list[dict[str, object]] = []
+            relationships: list[dict[str, object]] = []
+            power_query = [
+                {
+                    "TableName": "Sales",
+                    "Expression": (
+                        'let Source = Value.NativeQuery(Sql.Database("server", "database"), '
+                        '"SELECT CAST(amount AS decimal(18,2)) AS amount_net FROM dbo.sales"), '
+                        'Typed = Table.TransformColumnTypes(Source,{{"amount_net", Currency.Type}}) in Typed'
+                    ),
+                }
+            ]
+            rls: list[dict[str, object]] = []
+            ols: list[dict[str, object]] = []
+            connections: list[dict[str, object]] = []
+
+        issues = []
+        semantic = read_model_metadata(FakeModel(), issues)
+        column = semantic.tables[0].columns[0]
+
+        self.assertEqual(column.data_type, "Decimal")
+        self.assertEqual(column.format_string, "#,0.00")
+        self.assertEqual(column.source_column, "amount_net")
+        self.assertEqual(column.native_data_type, "SQL: decimal(18,2); M: Currency.Type")
+        self.assertEqual(column.summarize_by, "Sum")
+        self.assertNotIn("server", repr(semantic))
+        self.assertNotIn("SELECT CAST", repr(semantic))
         self.assertFalse(issues)
 
 

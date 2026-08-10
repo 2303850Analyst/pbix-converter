@@ -159,6 +159,8 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
     schema_rows = safe_records(model, "schema", issues)
     statistics_rows = safe_records(model, "statistics", issues)
     calculated_rows = safe_records(model, "dax_columns", issues)
+    power_query_rows = safe_records(model, "power_query", issues)
+    native_types = native_query_column_types(power_query_rows)
 
     schema_index = {
         (str(rget(item, "TableName", "Table")), str(rget(item, "ColumnName", "Name"))): item
@@ -196,14 +198,22 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
         stats = statistics_index.get((table_name, name), {})
         calculated = calculated_index.get((table_name, name), {})
         cardinality = rget(stats, "Cardinality")
+        source_column = text_or_none(rget(row, "SourceColumn", "SourceName"))
+        native_type = native_types.get((table_name.casefold(), (source_column or name).casefold()))
+        if native_type is None and source_column:
+            native_type = native_types.get((table_name.casefold(), name.casefold()))
         table.columns.append(
             ColumnInfo(
                 table_name,
                 name,
-                text_or_none(rget(schema, "PandasDataType", "DataType") or rget(row, "DataType")),
+                model_data_type(row, schema),
                 bool_value(rget(row, "IsHidden", "Hidden")),
                 int(cardinality) if cardinality is not None else None,
                 text_or_none(rget(calculated, "Expression")),
+                format_string=text_or_none(rget(row, "FormatString", "Format")),
+                source_column=source_column,
+                native_data_type=native_type,
+                summarize_by=text_or_none(rget(row, "SummarizeBy", "DefaultSummarization")),
             )
         )
 
@@ -227,6 +237,7 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
                 text_or_none(rget(row, "FormatString", "Format")),
                 text_or_none(rget(row, "DisplayFolder")),
                 text_or_none(rget(row, "Description")),
+                text_or_none(rget(row, "DataType", "Type")),
             )
         )
 
@@ -248,7 +259,7 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
         )
 
     queries: list[QueryInfo] = []
-    for row in safe_records(model, "power_query", issues):
+    for row in power_query_rows:
         name = text_or_none(rget(row, "TableName", "Name"))
         if name:
             expression = text_or_none(rget(row, "Expression"))
@@ -298,6 +309,76 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
         connection_types,
         package_version(),
     )
+
+
+def model_data_type(row: dict[str, Any], schema: dict[str, Any]) -> str | None:
+    raw = rget(row, "DataType", "Type")
+    if raw is not None and not isinstance(raw, (int, float)):
+        text = text_or_none(raw)
+        if text and not text.isdigit():
+            return text
+    return text_or_none(
+        rget(schema, "SemanticType", "DataType", "PandasDataType")
+        or raw
+    )
+
+
+def native_query_column_types(rows: list[dict[str, Any]]) -> dict[tuple[str, str], str]:
+    result: dict[tuple[str, str], str] = {}
+    for row in rows:
+        table = text_or_none(rget(row, "TableName", "Name"))
+        expression = text_or_none(rget(row, "Expression"))
+        if not table or not expression:
+            continue
+        for column, values in extract_native_types(expression).items():
+            result[(table.casefold(), column.casefold())] = "; ".join(values)
+    return result
+
+
+def extract_native_types(expression: str) -> dict[str, list[str]]:
+    found: dict[str, list[str]] = defaultdict(list)
+    sql_text = expression.replace('""', '"')
+    cast_pattern = re.compile(
+        r"\bCAST\s*\(.*?\bAS\s+"
+        r"([A-Za-z][A-Za-z0-9_ ]*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)\s*\)\s+AS\s+"
+        r"(?:\[([^\]]+)\]|\"([^\"]+)\"|`([^`]+)`|([A-Za-z_][A-Za-z0-9_$]*))",
+        re.IGNORECASE | re.DOTALL,
+    )
+    convert_pattern = re.compile(
+        r"\bCONVERT\s*\(\s*"
+        r"([A-Za-z][A-Za-z0-9_ ]*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)\s*,.*?\)\s+AS\s+"
+        r"(?:\[([^\]]+)\]|\"([^\"]+)\"|`([^`]+)`|([A-Za-z_][A-Za-z0-9_$]*))",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for pattern in (cast_pattern, convert_pattern):
+        for match in pattern.finditer(sql_text):
+            data_type = compact_metadata(match.group(1))
+            alias = next((value for value in match.groups()[1:] if value), None)
+            if alias and data_type:
+                _append_unique(found[compact_metadata(alias)], f"SQL: {data_type}")
+
+    m_type_pattern = re.compile(
+        r'\{\s*"((?:[^\"]|\"\")+)"\s*,\s*'
+        r'((?:type\s+(?:nullable\s+)?)?[A-Za-z_][A-Za-z0-9_.]*)\s*\}',
+        re.IGNORECASE,
+    )
+    for match in m_type_pattern.finditer(expression):
+        column = compact_metadata(match.group(1).replace('""', '"'))
+        data_type = compact_metadata(match.group(2))
+        if column and data_type:
+            _append_unique(found[column], f"M: {data_type}")
+    return dict(found)
+
+
+def compact_metadata(value: Any, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    text = "".join(char for char in text if ord(char) >= 32)
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _append_unique(target: list[str], value: str) -> None:
+    if value and value not in target:
+        target.append(value)
 
 
 def safe_records(model: Any, property_name: str, issues: list[Issue]) -> list[dict[str, Any]]:

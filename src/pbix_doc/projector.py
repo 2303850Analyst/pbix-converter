@@ -12,8 +12,10 @@ from .domain import DocumentationModel, FilterInfo, MeasureInfo, PageInfo, Visua
 MAX_DAX_CHARS = 8_000
 MAX_DEPENDENCIES = 100
 MAX_TABLE_ROWS = 500
+MAX_FIELD_REGISTRY_ROWS = 5_000
 MAX_VISUALS = 1_000
 TABLE_WIDTH_DXA = 9_360
+LANDSCAPE_TABLE_WIDTH_DXA = 14_400
 OVERFLOW = "<PARTIAL — ЧАСТЬ СВЕДЕНИЙ НЕ ВКЛЮЧЕНА ИЗ-ЗА ЛИМИТА ДОКУМЕНТА>"
 
 
@@ -40,6 +42,8 @@ class TableBlock:
     headers: tuple[str, ...]
     rows: list[tuple[str, ...]]
     widths_dxa: tuple[int, ...]
+    font_size: float | None = None
+    allow_row_split: bool = False
 
 
 @dataclass(slots=True)
@@ -48,7 +52,12 @@ class CodeBlock:
     status: str = "OK"
 
 
-DocumentBlock = HeadingBlock | ParagraphBlock | ListBlock | TableBlock | CodeBlock
+@dataclass(slots=True)
+class SectionBreakBlock:
+    orientation: str
+
+
+DocumentBlock = HeadingBlock | ParagraphBlock | ListBlock | TableBlock | CodeBlock | SectionBreakBlock
 
 
 @dataclass(slots=True)
@@ -84,6 +93,24 @@ class KpiProjection:
     status: str
 
 
+@dataclass(slots=True)
+class FieldRegistryEntry:
+    object_type: str
+    table: str
+    name: str
+    data_type: str | None = None
+    format_string: str | None = None
+    dax_expression: str | None = None
+    source_column: str | None = None
+    native_data_type: str | None = None
+    summarize_by: str | None = None
+    aliases: set[str] = field(default_factory=set)
+    pages: set[str] = field(default_factory=set)
+    visuals: set[str] = field(default_factory=set)
+    aggregations: set[str] = field(default_factory=set)
+    dax_usages: set[str] = field(default_factory=set)
+
+
 def overall_status(model: DocumentationModel) -> str:
     if not model.report.pages:
         return "FAILED"
@@ -113,6 +140,7 @@ def project_document(model: DocumentationModel) -> SafeDocumentModel:
 
     blocks: list[DocumentBlock] = []
     blocks.extend(_passport(model, pages, page_ids))
+    blocks.extend(_field_registry(model, pages, page_ids, visual_ids))
     blocks.extend(_difference_index(model, pages, page_ids, visual_ids, bookmark_ids))
     blocks.extend(_kpi_catalog(kpis))
     blocks.extend(_page_guide(model, pages, page_ids, visual_ids, bookmark_ids))
@@ -214,14 +242,235 @@ def _passport(
             (900, 3_000, 1_800, 1_800, 1_860),
         ),
     ]
+    blocks.append(HeadingBlock(2, "Фильтры уровня отчёта"))
     if report.report_filters:
-        blocks.extend(
-            [
-                HeadingBlock(2, "Фильтры уровня отчёта"),
-                _filter_table(report.report_filters),
-            ]
-        )
+        blocks.append(_filter_table(report.report_filters))
+    else:
+        blocks.append(ParagraphBlock("Фильтры уровня отчёта не найдены."))
     return blocks
+
+
+def _field_registry(
+    model: DocumentationModel,
+    pages: list[PageInfo],
+    page_ids: dict[str, str],
+    visual_ids: dict[tuple[str, str], str],
+) -> list[DocumentBlock]:
+    entries: dict[tuple[str, str, str], FieldRegistryEntry] = {}
+    by_name: dict[tuple[str, str], list[FieldRegistryEntry]] = defaultdict(list)
+
+    def add_entry(entry: FieldRegistryEntry) -> FieldRegistryEntry:
+        key = (entry.object_type, entry.table.casefold(), entry.name.casefold())
+        current = entries.get(key)
+        if current is None:
+            entries[key] = entry
+            by_name[(entry.table.casefold(), entry.name.casefold())].append(entry)
+            return entry
+        return current
+
+    for table in model.semantic_model.tables:
+        for column in table.columns:
+            add_entry(
+                FieldRegistryEntry(
+                    "COLUMN",
+                    column.table,
+                    column.name,
+                    column.data_type,
+                    column.format_string,
+                    column.expression,
+                    column.source_column,
+                    column.native_data_type,
+                    column.summarize_by,
+                )
+            )
+    for measure in model.semantic_model.measures:
+        add_entry(
+            FieldRegistryEntry(
+                "MEASURE",
+                measure.table,
+                measure.name,
+                measure.data_type,
+                measure.format_string,
+                measure.expression,
+            )
+        )
+
+    def resolve_entry(table: str | None, name: str, object_type: str) -> FieldRegistryEntry:
+        normalized_type = "MEASURE" if object_type == "MEASURE" else "COLUMN"
+        normalized_table = table or "<UNKNOWN>"
+        exact = entries.get((normalized_type, normalized_table.casefold(), name.casefold()))
+        if exact:
+            return exact
+        matches = by_name.get((normalized_table.casefold(), name.casefold()), [])
+        if len(matches) == 1:
+            return matches[0]
+        return add_entry(FieldRegistryEntry(normalized_type, normalized_table, name))
+
+    for page in pages:
+        page_label = f"{page_ids[page.id]} · {clean_text(page.name)}"
+        for visual in page.visuals:
+            visual_label = (
+                f"{visual_ids[(page.id, visual.id)]} · {clean_text(visual.title)} "
+                f"({page_ids[page.id]})"
+            )
+            for item in visual.fields:
+                entry = resolve_entry(item.table, item.name, item.object_type)
+                if clean_text(visual.title):
+                    entry.aliases.add(clean_text(visual.title))
+                entry.pages.add(page_label)
+                entry.visuals.add(visual_label)
+                if item.aggregation:
+                    entry.aggregations.add(
+                        f"{clean_text(item.aggregation)} — {page_ids[page.id]} / "
+                        f"{visual_ids[(page.id, visual.id)]}"
+                    )
+            for item in visual.filters:
+                parsed = _qualified_parts(item.field)
+                if parsed:
+                    entry = resolve_entry(parsed[0], parsed[1], "COLUMN")
+                    entry.pages.add(f"{page_label} (фильтр визуала)")
+                    entry.visuals.add(visual_label)
+
+        for item in page.filters:
+            parsed = _qualified_parts(item.field)
+            if parsed:
+                entry = resolve_entry(parsed[0], parsed[1], "COLUMN")
+                entry.aliases.add("Фильтр листа")
+                entry.pages.add(f"{page_label} (фильтр листа)")
+
+    for item in model.report.report_filters:
+        parsed = _qualified_parts(item.field)
+        if parsed:
+            entry = resolve_entry(parsed[0], parsed[1], "COLUMN")
+            entry.aliases.add("Фильтр уровня отчёта")
+            entry.pages.add("Все листы (фильтр уровня отчёта)")
+
+    formula_owners: list[tuple[FieldRegistryEntry, DaxProjection]] = []
+    for entry in entries.values():
+        if entry.dax_expression:
+            formula_owners.append((entry, sanitize_dax(entry.dax_expression)))
+    for owner, dax in formula_owners:
+        owner_label = f"{owner.table}[{owner.name}]"
+        for reference in dax.references:
+            target = _resolve_registry_reference(reference, owner, entries, by_name)
+            if target:
+                target.dax_usages.add(owner_label)
+
+    rows: list[tuple[str, ...]] = []
+    ordered = sorted(
+        entries.values(),
+        key=lambda item: (item.table.casefold(), item.name.casefold(), item.object_type),
+    )
+    for entry in ordered[:MAX_FIELD_REGISTRY_ROWS]:
+        dax = sanitize_dax(entry.dax_expression)
+        dax_text = dax.text or (dax.reason if entry.dax_expression else "—")
+        model_format = [
+            f"Объект: {'мера' if entry.object_type == 'MEASURE' else 'поле'}",
+            f"Тип: {clean_text(entry.data_type or 'NOT_AVAILABLE')}",
+        ]
+        if entry.format_string:
+            model_format.append(f"Отображение: {clean_text(entry.format_string)}")
+        aggregations = set(entry.aggregations)
+        if entry.summarize_by:
+            aggregations.add(f"По умолчанию в модели: {clean_text(entry.summarize_by)}")
+        native_name = "не применимо" if entry.object_type == "MEASURE" else clean_text(
+            entry.source_column or "NOT_AVAILABLE"
+        )
+        native_type = "не применимо" if entry.object_type == "MEASURE" else clean_text(
+            entry.native_data_type or "NOT_AVAILABLE"
+        )
+        rows.append(
+            (
+                f"{clean_text(entry.table)}[{clean_text(entry.name)}]",
+                _joined(entry.aliases),
+                "; ".join(model_format),
+                "",
+                clean_text(dax_text, preserve_newlines=True, limit=MAX_DAX_CHARS + len(OVERFLOW)),
+                _joined(entry.pages),
+                native_name,
+                native_type,
+                _joined(entry.dax_usages),
+                _joined(entry.visuals),
+                _joined(aggregations),
+            )
+        )
+    if len(ordered) > MAX_FIELD_REGISTRY_ROWS:
+        rows.append((OVERFLOW,) + ("",) * 10)
+
+    blocks: list[DocumentBlock] = [
+        SectionBreakBlock("landscape"),
+        HeadingBlock(1, "Реестр полей отчёта"),
+        ParagraphBlock(
+            "Реестр объединяет локальную семантическую модель, DAX и найденные привязки отчёта. "
+            "Колонка «Объяснение» намеренно оставлена пустой для ручного заполнения разработчиком. "
+            "NativeQuery не выполняется; показываются только безопасно извлечённые имя и тип.",
+            "lead",
+        ),
+    ]
+    if rows:
+        blocks.append(
+            TableBlock(
+                (
+                    "Таблица[поле]",
+                    "Варианты названий / обозначений в отчёте",
+                    "Формат данных в Power BI и формат отображения",
+                    "Объяснение (заполняется разработчиком)",
+                    "Выражение DAX (если применимо)",
+                    "Листы, где применяется",
+                    "Наименование из NativeQuery при импорте",
+                    "Формат данных из NativeQuery",
+                    "В каких DAX-формулах применяется",
+                    "В каких визуалах применяется",
+                    "Все агрегации и места применения",
+                ),
+                rows,
+                (1_400, 1_400, 1_200, 1_100, 1_750, 1_050, 1_100, 1_100, 1_300, 1_500, 1_500),
+                font_size=7.2,
+                allow_row_split=True,
+            )
+        )
+    else:
+        blocks.append(ParagraphBlock("Поля в доступной локальной метадате не найдены.", "warning"))
+    blocks.append(SectionBreakBlock("portrait"))
+    return blocks
+
+
+def _qualified_parts(value: str) -> tuple[str, str] | None:
+    match = re.fullmatch(r"\s*(?:'((?:[^']|'')+)'|([^\[]+))\[([^\]]+)\]\s*", value or "")
+    if not match:
+        return None
+    table = (match.group(1) or match.group(2) or "").replace("''", "'").strip()
+    name = match.group(3).strip()
+    return (table, name) if table and name else None
+
+
+def _resolve_registry_reference(
+    reference: str,
+    owner: FieldRegistryEntry,
+    entries: dict[tuple[str, str, str], FieldRegistryEntry],
+    by_name: dict[tuple[str, str], list[FieldRegistryEntry]],
+) -> FieldRegistryEntry | None:
+    if reference.startswith("[") and reference.endswith("]"):
+        name = reference[1:-1].casefold()
+        measures = [
+            entry
+            for (object_type, _, field_name), entry in entries.items()
+            if object_type == "MEASURE" and field_name == name
+        ]
+        if len(measures) == 1:
+            return measures[0]
+        same_table = entries.get(("COLUMN", owner.table.casefold(), name))
+        return same_table
+    parsed = _qualified_parts(reference)
+    if not parsed:
+        return None
+    matches = by_name.get((parsed[0].casefold(), parsed[1].casefold()), [])
+    return matches[0] if len(matches) == 1 else None
+
+
+def _joined(values: Iterable[str]) -> str:
+    ordered = sorted({clean_text(value) for value in values if clean_text(value)}, key=str.casefold)
+    return "; ".join(ordered) or "—"
 
 
 def _difference_index(

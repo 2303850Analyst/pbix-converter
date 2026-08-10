@@ -1,7 +1,7 @@
 # PBIX Documentation CLI — locked architecture baseline
 
 Status: **approved and locked**
-Baseline version: **2.0**
+Baseline version: **2.1**
 Change rule: this document changes only after explicit user approval.
 
 ## 1. Product contract
@@ -73,6 +73,8 @@ CLI / Controller
 
 `DocumentProjector` receives the normalized and policy-safe domain model and derives user-facing KPI lineage, same-name comparison groups, explicit context evidence, bookmark cards, navigation indexes, and document-local references. The DOCX renderer receives only `SafeDocumentModel`. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, the normalized PBIX model, or unsanitized saved values.
 
+Immediately after the report-level filters, the projector emits a single field registry. It combines every locally discovered semantic column, measure, calculated column, report field reference, filter reference, visual usage, aggregation, and DAX dependency. NativeQuery is never executed or copied into the safe document model: the semantic adapter retains only normalized source-column names and data-type declarations extracted from model metadata, SQL `CAST`/`CONVERT`, or Power Query type steps.
+
 ## 3. Input handling
 
 The preflight layer verifies:
@@ -126,6 +128,8 @@ The adapter may expose:
 - RLS and OLS definitions;
 - connection metadata;
 - model status.
+
+For every locally available column, the adapter also normalizes the Power BI data type, display format, default summarization, `SourceColumn`, and a NativeQuery/M type declaration when it can be established without executing M or SQL. Missing metadata is represented as `NOT_AVAILABLE`; the adapter must not infer a source name or type from business values.
 
 Supported model statuses:
 
@@ -214,6 +218,8 @@ DocumentationModel
 
 Every field use retains its report scope, usage type, page/visual ID, role, aggregation, evidence path, and resolution status.
 
+Each normalized semantic column may additionally retain `format_string`, `source_column`, `native_data_type`, and `summarize_by`. These are metadata only. Raw Power Query, SQL text, server/database literals, credentials, and connection strings do not enter the safe document model.
+
 ### 8.1 Document projection and evidence taxonomy
 
 `DocumentProjector` is a deterministic interpretation boundary. It may derive only facts supported by normalized metadata and produces:
@@ -224,6 +230,24 @@ Every field use retains its report scope, usage type, page/visual ID, role, aggr
 - groups of identical visible titles used with different semantic objects or contexts;
 - incoming and outgoing navigation indexes and direct user journeys;
 - `PARTIAL`, `UNRESOLVED`, and overflow markers.
+
+The field registry is mandatory and appears immediately after `Фильтры уровня отчёта`. Its columns are fixed:
+
+```text
+Таблица[поле]
+Варианты названий / обозначений в отчёте
+Формат данных в Power BI и формат отображения
+Объяснение (пустая ячейка для ручного заполнения разработчиком)
+Выражение DAX (если применимо)
+Листы, где применяется
+Наименование из NativeQuery при импорте
+Формат данных из NativeQuery
+В каких DAX-формулах применяется
+В каких визуалах применяется
+Все агрегации и места применения
+```
+
+The registry includes model objects even when they are unused by a visual. Visual references use the document-local page and visual IDs. DAX expressions use the normal token-aware sanitization policy, and the dependency column lists formula object names rather than evaluated results. The explanation column is intentionally empty and is never populated automatically.
 
 The comparison taxonomy is fixed:
 
@@ -376,18 +400,20 @@ Diagnostics are printed to the console and included in the final DOCX. No perman
 
 ```text
 1. Report passport, extraction status, and terminology
-2. Same visible name — possible structural or context differences
-3. KPI and calculation catalog
-4. Page and visual guide
-5. Buttons, bookmarks, navigators, tooltip, and drillthrough
-6. Direct user journeys
-7. Semantic model and relationships
-8. Power Query and sources
-9. RLS and OLS
-10. Unresolved references, diagnostics, and technical appendix
+2. Report-level filters
+3. Complete field registry
+4. Same visible name — possible structural or context differences
+5. KPI and calculation catalog
+6. Page and visual guide
+7. Buttons, bookmarks, navigators, tooltip, and drillthrough
+8. Direct user journeys
+9. Semantic model and relationships
+10. Power Query and sources
+11. RLS and OLS
+12. Unresolved references, diagnostics, and technical appendix
 ```
 
-The DOCX uses the `compact_reference_guide` design preset with an Arial 11 pt body override, built-in `Heading 1`–`Heading 3`, a monospaced code style for DAX, a single-column portrait layout, and native Word tables. Tables have explicit fixed geometry, repeated header rows, no merged or nested cells, and at most five columns. Color is never the sole carrier of meaning. Critical navigation does not depend on Word hyperlinks surviving Confluence import.
+The DOCX uses the `compact_reference_guide` design preset with an Arial 11 pt body override, built-in `Heading 1`–`Heading 3`, a monospaced code style for DAX, and native Word tables. The document is portrait except for the field registry, which uses a dedicated landscape section and an 11-column compact table. All tables have explicit fixed geometry, repeated header rows, and no merged or nested cells; ordinary tables have at most five columns. Registry rows may continue across pages when their sanitized DAX is long. Color is never the sole carrier of meaning. Critical navigation does not depend on Word hyperlinks surviving Confluence import.
 
 The package is macro-free OOXML. Before publication, `OOXMLValidator` rejects macros, OLE/ActiveX or embedded objects, remote templates, external relationships, external hyperlinks, automatic fields, unsafe member paths, duplicate members, invalid XML, disallowed control characters, and package or part size violations. The writer uses a same-directory temporary file, validates it, fsyncs it, and performs atomic replacement where the filesystem supports it.
 

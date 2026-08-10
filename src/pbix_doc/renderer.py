@@ -8,7 +8,7 @@ from pathlib import Path
 
 from docx import Document
 from docx.document import Document as DocumentObject
-from docx.enum.section import WD_SECTION
+from docx.enum.section import WD_ORIENT, WD_SECTION
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
@@ -22,6 +22,7 @@ from .projector import (
     ListBlock,
     ParagraphBlock,
     SafeDocumentModel,
+    SectionBreakBlock,
     TableBlock,
     clean_text,
 )
@@ -29,6 +30,7 @@ from .runtime import atomic_temp_prefix, cleanup_stale_artifacts
 
 
 CONTENT_WIDTH_DXA = 9_360
+LANDSCAPE_CONTENT_WIDTH_DXA = 14_400
 BLUE = "2E5E8C"
 DARK_BLUE = "17365D"
 LIGHT_BLUE = "E8EEF5"
@@ -53,6 +55,8 @@ def render_document(model: SafeDocumentModel) -> bytes:
             _add_table(document, block)
         elif isinstance(block, CodeBlock):
             _add_code(document, block)
+        elif isinstance(block, SectionBreakBlock):
+            _add_section_break(document, block)
     stream = BytesIO()
     document.save(stream)
     return _canonicalize_package(stream.getvalue())
@@ -87,12 +91,7 @@ def atomic_write(output_path: Path, payload: bytes) -> None:
 
 def _configure_document(document: DocumentObject) -> None:
     section = document.sections[0]
-    section.page_width = Inches(8.5)
-    section.page_height = Inches(11)
-    section.top_margin = Inches(1)
-    section.right_margin = Inches(1)
-    section.bottom_margin = Inches(1)
-    section.left_margin = Inches(1)
+    _configure_section(section, "portrait")
     section.header_distance = Inches(0.492)
     section.footer_distance = Inches(0.492)
 
@@ -197,6 +196,30 @@ def _add_heading(document: DocumentObject, block: HeadingBlock) -> None:
     document.add_heading(text, level=min(3, max(1, block.level)))
 
 
+def _add_section_break(document: DocumentObject, block: SectionBreakBlock) -> None:
+    section = document.add_section(WD_SECTION.NEW_PAGE)
+    _configure_section(section, block.orientation)
+
+
+def _configure_section(section: object, orientation: str) -> None:
+    if orientation == "landscape":
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width = Inches(11)
+        section.page_height = Inches(8.5)
+        margin = Inches(0.5)
+    elif orientation == "portrait":
+        section.orientation = WD_ORIENT.PORTRAIT
+        section.page_width = Inches(8.5)
+        section.page_height = Inches(11)
+        margin = Inches(1)
+    else:
+        raise ValueError(f"Неизвестная ориентация секции: {orientation}")
+    section.top_margin = margin
+    section.right_margin = margin
+    section.bottom_margin = margin
+    section.left_margin = margin
+
+
 def _add_paragraph(document: DocumentObject, block: ParagraphBlock) -> None:
     paragraph = document.add_paragraph()
     paragraph.paragraph_format.space_after = Pt(7)
@@ -220,9 +243,13 @@ def _add_list(document: DocumentObject, block: ListBlock) -> None:
 
 
 def _add_table(document: DocumentObject, block: TableBlock) -> None:
-    if not block.headers or len(block.headers) > 5:
-        raise ValueError("DOCX-таблица должна содержать от одной до пяти колонок")
-    if len(block.headers) != len(block.widths_dxa) or sum(block.widths_dxa) != CONTENT_WIDTH_DXA:
+    if not block.headers or len(block.headers) > 12:
+        raise ValueError("DOCX-таблица должна содержать от одной до двенадцати колонок")
+    total_width = sum(block.widths_dxa)
+    if len(block.headers) != len(block.widths_dxa) or total_width not in {
+        CONTENT_WIDTH_DXA,
+        LANDSCAPE_CONTENT_WIDTH_DXA,
+    }:
         raise ValueError("Некорректная геометрия DOCX-таблицы")
     table = document.add_table(rows=1, cols=len(block.headers))
     table.style = "Table Grid"
@@ -230,17 +257,28 @@ def _add_table(document: DocumentObject, block: TableBlock) -> None:
     table.autofit = False
     header = table.rows[0]
     _repeat_header(header)
+    font_size = block.font_size or (7.2 if len(block.headers) > 5 else 9.2)
+    padding = 55 if len(block.headers) > 5 else 80
     for index, value in enumerate(block.headers):
-        _set_cell_text(header.cells[index], value, bold=True, color=DARK_BLUE, fill=LIGHT_BLUE)
+        _set_cell_text(
+            header.cells[index],
+            value,
+            bold=True,
+            color=DARK_BLUE,
+            fill=LIGHT_BLUE,
+            font_size=font_size,
+            padding=padding,
+        )
     for values in block.rows:
         if len(values) != len(block.headers):
             raise ValueError("Строка DOCX-таблицы не совпадает с заголовком")
         row = table.add_row()
         for index, value in enumerate(values):
-            _set_cell_text(row.cells[index], value)
-    _set_table_geometry(table, block.widths_dxa)
-    for row in table.rows:
-        _prevent_row_split(row)
+            _set_cell_text(row.cells[index], value, font_size=font_size, padding=padding)
+    _set_table_geometry(table, block.widths_dxa, total_width)
+    if not block.allow_row_split:
+        for row in table.rows:
+            _prevent_row_split(row)
     after = document.add_paragraph()
     after.paragraph_format.space_after = Pt(2)
 
@@ -267,29 +305,31 @@ def _set_cell_text(
     bold: bool = False,
     color: str = "000000",
     fill: str | None = None,
+    font_size: float = 9.2,
+    padding: int = 80,
 ) -> None:
     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-    _set_cell_margins(cell, top=80, bottom=80, start=120, end=120)
+    _set_cell_margins(cell, top=padding, bottom=padding, start=padding, end=padding)
     paragraph = cell.paragraphs[0]
     paragraph.paragraph_format.space_before = Pt(0)
     paragraph.paragraph_format.space_after = Pt(0)
     paragraph.paragraph_format.line_spacing = 1.05
     paragraph.paragraph_format.keep_with_next = bold
     run = paragraph.add_run(clean_text(value, preserve_newlines=True, limit=4_000))
-    _set_run_font(run, "Arial", 9.2, color, bold=bold)
+    _set_run_font(run, "Arial", font_size, color, bold=bold)
     if fill:
         shading = OxmlElement("w:shd")
         shading.set(qn("w:fill"), fill)
         cell._tc.get_or_add_tcPr().append(shading)
 
 
-def _set_table_geometry(table: object, widths: tuple[int, ...]) -> None:
+def _set_table_geometry(table: object, widths: tuple[int, ...], total_width: int) -> None:
     properties = table._tbl.tblPr
     width = properties.first_child_found_in("w:tblW")
     if width is None:
         width = OxmlElement("w:tblW")
         properties.append(width)
-    width.set(qn("w:w"), str(CONTENT_WIDTH_DXA))
+    width.set(qn("w:w"), str(total_width))
     width.set(qn("w:type"), "dxa")
     indent = properties.first_child_found_in("w:tblInd")
     if indent is None:
