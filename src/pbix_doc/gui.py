@@ -8,9 +8,11 @@ from tkinter import ttk
 
 from .pipeline import MAX_EXAMPLE_VALUES, Options, generate_documentation
 from .renderer import overall_status
+from .runtime import RuntimePolicyViolation
 
 
 def launch_gui(example_limit: int = 5) -> int:
+    exit_code = 0
     root = Tk()
     root.withdraw()
     root.update_idletasks()
@@ -65,10 +67,13 @@ def launch_gui(example_limit: int = 5) -> int:
                 progress,
             )
             messages.put(("success", model))
+        except RuntimePolicyViolation as error:
+            messages.put(("policy_error", error))
         except Exception as error:
             messages.put(("error", error))
 
     def poll() -> None:
+        nonlocal exit_code
         try:
             while True:
                 kind, payload = messages.get_nowait()
@@ -77,6 +82,7 @@ def launch_gui(example_limit: int = 5) -> int:
                 elif kind == "success":
                     progress_bar.stop()
                     status = overall_status(payload)  # type: ignore[arg-type]
+                    exit_code = 0 if status == "OK" else 2
                     messagebox.showinfo(
                         "Готово",
                         f"Документация сохранена:\n{output_name}\n\nСтатус: {status}",
@@ -84,8 +90,15 @@ def launch_gui(example_limit: int = 5) -> int:
                     )
                     root.destroy()
                     return
+                elif kind == "policy_error":
+                    progress_bar.stop()
+                    exit_code = 4
+                    messagebox.showerror("Критическая ошибка политики VDI", str(payload), parent=root)
+                    root.destroy()
+                    return
                 elif kind == "error":
                     progress_bar.stop()
+                    exit_code = 1
                     messagebox.showerror("Ошибка", str(payload), parent=root)
                     root.destroy()
                     return
@@ -96,4 +109,4 @@ def launch_gui(example_limit: int = 5) -> int:
     threading.Thread(target=worker, daemon=True).start()
     root.after(100, poll)
     root.mainloop()
-    return 0
+    return exit_code

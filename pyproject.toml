@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = ["pbixray==0.15.4"]
 
 [project.scripts]
-pbix-doc = "pbix_doc.cli:main"
+pbix-doc = "pbix_doc.bootstrap:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

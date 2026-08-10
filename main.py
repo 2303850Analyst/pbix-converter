@@ -1,4 +1,4 @@
-from pbix_doc.cli import main
+from pbix_doc.bootstrap import main
 
 
 if __name__ == "__main__":

@@ -15,14 +15,8 @@ WORKSPACE_PREFIX = ".pbix_doc_runtime_"
 WORKSPACE_MARKER = ".pbix_doc_owner"
 ATOMIC_PREFIX = ".pbix_doc_output_"
 
-_guard_installed = False
-_blocked_events = {
-    "os.exec",
-    "os.posix_spawn",
-    "os.spawn",
-    "os.startfile",
-    "os.system",
-    "subprocess.Popen",
+_guards_installed = False
+_network_events = {
     "socket.__new__",
     "socket.bind",
     "socket.connect",
@@ -34,24 +28,44 @@ _blocked_events = {
     "socket.sendto",
     "urllib.Request",
 }
+_process_events = {
+    "os.exec",
+    "os.posix_spawn",
+    "os.spawn",
+    "os.startfile",
+    "os.system",
+    "subprocess.Popen",
+}
 _atomic_name = re.compile(r"^\.pbix_doc_output_(\d+)_.*\.tmp$")
 
 
-class OfflineRuntimeViolation(RuntimeError):
+class RuntimePolicyViolation(BaseException):
+    """Fatal policy violation that ordinary recovery must not suppress."""
+
     pass
 
 
-def install_offline_guard() -> None:
-    global _guard_installed
-    if _guard_installed:
+class NetworkEgressViolation(RuntimePolicyViolation):
+    pass
+
+
+class ExternalProcessViolation(RuntimePolicyViolation):
+    pass
+
+
+def install_runtime_guards() -> None:
+    global _guards_installed
+    if _guards_installed:
         return
     sys.addaudithook(_audit_event)
-    _guard_installed = True
+    _guards_installed = True
 
 
 def _audit_event(event: str, _: tuple[object, ...]) -> None:
-    if event in _blocked_events:
-        raise OfflineRuntimeViolation(f"Операция запрещена политикой VDI_OFFLINE_RUNTIME: {event}")
+    if event in _network_events:
+        raise NetworkEgressViolation(f"Сетевая операция запрещена политикой VDI_OFFLINE_RUNTIME: {event}")
+    if event in _process_events:
+        raise ExternalProcessViolation(f"Запуск внешнего процесса запрещён политикой VDI_OFFLINE_RUNTIME: {event}")
 
 
 @contextmanager

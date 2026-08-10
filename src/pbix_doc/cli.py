@@ -9,6 +9,7 @@ from . import __version__
 from .gui import launch_gui
 from .pipeline import MAX_EXAMPLE_VALUES, Options, generate_documentation
 from .renderer import overall_status
+from .runtime import RuntimePolicyViolation
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +37,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             Options(limit),
             lambda message: print(message, flush=True),
         )
+    except RuntimePolicyViolation as error:
+        print(f"Критическая ошибка политики VDI: {error}", file=sys.stderr)
+        return 4
     except Exception as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 1

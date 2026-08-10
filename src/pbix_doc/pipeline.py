@@ -11,7 +11,7 @@ from . import __version__
 from .container import PbixContainer
 from .domain import DocumentationModel, FileInfo, Issue, SemanticModelInfo
 from .report import parse_report
-from .runtime import install_offline_guard, managed_workspace
+from .runtime import install_runtime_guards, managed_workspace
 from .semantic import load_semantic_model
 
 
@@ -31,7 +31,7 @@ def analyze_pbix(
     *,
     workspace_parent: Path | None = None,
 ) -> DocumentationModel:
-    install_offline_guard()
+    install_runtime_guards()
     options = options or Options()
     input_path = input_path.resolve()
     if input_path.suffix.casefold() != ".pbix":

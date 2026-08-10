@@ -6,8 +6,11 @@ import contextlib
 import io
 import json
 import os
+import socket
+import subprocess
 import sys
 import tempfile
+import types
 import unittest
 import zipfile
 from datetime import datetime, timezone
@@ -30,11 +33,12 @@ from pbix_doc.report import parse_report
 from pbix_doc.runtime import (
     WORKSPACE_MARKER,
     WORKSPACE_PREFIX,
-    OfflineRuntimeViolation,
+    ExternalProcessViolation,
+    NetworkEgressViolation,
     cleanup_stale_artifacts,
-    install_offline_guard,
+    install_runtime_guards,
 )
-from pbix_doc.semantic import profile_examples, safe_error_message
+from pbix_doc.semantic import load_semantic_model, profile_examples, safe_error_message
 
 
 def write_zip(path: Path, parts: dict[str, object]) -> None:
@@ -323,11 +327,31 @@ class RuntimePolicyTests(unittest.TestCase):
             cleanup_stale_artifacts(parent)
             self.assertFalse(stale.exists())
 
-    def test_runtime_guard_blocks_network_and_external_processes(self) -> None:
-        install_offline_guard()
-        for event in ("socket.__new__", "socket.connect", "socket.sendto", "subprocess.Popen", "os.system"):
-            with self.subTest(event=event), self.assertRaises(OfflineRuntimeViolation):
+    def test_runtime_guards_separate_network_and_process_violations(self) -> None:
+        install_runtime_guards()
+        for event in ("socket.__new__", "socket.connect", "socket.sendto"):
+            with self.subTest(event=event), self.assertRaises(NetworkEgressViolation):
                 sys.audit(event)
+        for event in ("subprocess.Popen", "os.system"):
+            with self.subTest(event=event), self.assertRaises(ExternalProcessViolation):
+                sys.audit(event)
+
+        with self.assertRaises(NetworkEgressViolation):
+            socket.socket()
+        with self.assertRaises(ExternalProcessViolation):
+            subprocess.run([sys.executable, "-c", "pass"], check=True)
+
+    def test_network_violation_cannot_be_downgraded_by_semantic_adapter(self) -> None:
+        fake_pbixray = types.ModuleType("pbixray")
+        fake_pbixray.LiveConnectionError = type("LiveConnectionError", (Exception,), {})
+        fake_pbixray.NoEmbeddedModelError = type("NoEmbeddedModelError", (Exception,), {})
+
+        def blocked(*_: object, **__: object) -> None:
+            raise NetworkEgressViolation("blocked")
+
+        fake_pbixray.PBIXRay = blocked
+        with patch.dict(sys.modules, {"pbixray": fake_pbixray}), self.assertRaises(NetworkEgressViolation):
+            load_semantic_model(Path("fixture.pbix"), None, 0, [])
 
     def test_application_source_has_no_network_or_process_imports(self) -> None:
         forbidden = {"git", "http", "requests", "socket", "subprocess", "urllib", "webbrowser"}
@@ -353,6 +377,21 @@ class RuntimePolicyTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("Ошибка:", errors.getvalue())
         self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_cli_returns_distinct_code_for_runtime_policy_violation(self) -> None:
+        errors = io.StringIO()
+        with (
+            patch("pbix_doc.cli.generate_documentation", side_effect=NetworkEgressViolation("blocked")),
+            contextlib.redirect_stderr(errors),
+        ):
+            exit_code = main(["input.pbix", "output.txt"])
+        self.assertEqual(exit_code, 4)
+        self.assertIn("Критическая ошибка политики VDI", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_bootstrap_installs_guards_before_cli_import(self) -> None:
+        source = Path(__file__).parents[1].joinpath("src", "pbix_doc", "bootstrap.py").read_text(encoding="utf-8")
+        self.assertLess(source.index("install_runtime_guards()"), source.index("from .cli import main"))
 
     def test_dependency_error_redacts_local_paths(self) -> None:
         sensitive_path = Path(r"C:\Corporate\Reports\secret.pbix")

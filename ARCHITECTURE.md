@@ -1,7 +1,7 @@
 # PBIX Documentation CLI — locked architecture baseline
 
 Status: **approved and locked**
-Baseline version: **1.2**
+Baseline version: **1.3**
 Change rule: this document changes only after explicit user approval.
 
 ## 1. Product contract
@@ -33,14 +33,17 @@ The application:
 - accepts only paths explicitly selected by the user in the VDI Explorer or passed to the CLI;
 - does not impose hard-coded drive, root-folder, UNC, mapped-drive, or reparse-point restrictions;
 - may use any corporate filesystem location exposed and authorized by the VDI environment;
-- does not create HTTP endpoints, make HTTP requests, open sockets, send webhooks, use telemetry, invoke cloud APIs, or launch external processes;
+- does not create HTTP endpoints, make HTTP requests, open sockets, send webhooks, use telemetry, invoke cloud APIs, or contain application logic that launches external processes;
 - does not invoke Git, package managers, browsers, Yandex Disk, or other sync clients at runtime;
-- installs an in-process audit guard before PBIX analysis to reject Python socket operations and external-process launches;
+- installs process-wide Python audit guards at the production entry point, before GUI, controller, parser, or third-party analysis imports;
+- treats every runtime-policy violation as a fatal error that cannot be downgraded to partial extraction;
 - produces no permanent logs and does not include the absolute source path in the TXT;
 - creates its extraction workspace beside the user-selected output, removes it normally, and removes abandoned application-owned workspaces on a later run;
 - keeps the atomic output temporary file beside the final TXT.
 
-Citrix clipboard, client-drive, USB, printing, session recording, and network policies are controlled by VDI administrators and are outside the Python application's authority. Operating-system egress controls remain the outer enforcement layer; the application guard is defense in depth.
+`NetworkEgressGuard` rejects Python socket creation, connection, DNS/service resolution, datagram sending, and `urllib` requests. Its purpose is to make accidental application or dependency network access fail closed. `ExternalProcessGuard` is a separate policy that rejects process-launch audit events so application code or a dependency cannot delegate transmission to another executable. Both violations use a dedicated fatal exit path.
+
+The audit guards are application-level regression controls, not a sandbox. They do not govern native DLL networking that bypasses CPython audit events, code executed before the production entry point, other processes, Citrix channels, or filesystem access to a user-selected UNC/mapped path. A selected network path may cause Windows to use SMB; this is an explicit user-directed filesystem operation, not autonomous application egress. Citrix clipboard, client-drive, USB, printing, session recording, network policies, firewall, and AppLocker/WDAC are controlled by VDI administrators and remain the authoritative outer enforcement layer.
 
 Development may use Git and synchronized development folders, but real corporate PBIX files must not be processed there. A VDI production release contains application wheels, pinned dependency wheels, checksums, and offline scripts only; it contains no `.git` directory and performs no package download during installation or execution.
 
@@ -48,7 +51,8 @@ Development may use Git and synchronized development folders, but real corporate
 
 ```text
 CLI / Controller
-    -> VDI Offline Runtime Guard
+    -> Network Egress Guard
+    -> External Process Guard
     -> Preflight Validator
     -> PBIX Container Reader
        -> Report Format Detector
@@ -379,6 +383,7 @@ The file-information section contains the PBIX filename, size, modification time
 2 = usable partial documentation was produced
 1 = input could not be read
 3 = output could not be written
+4 = a VDI runtime policy blocked a network or external-process operation
 ```
 
 Partial output is preferred whenever at least one meaningful subsystem succeeded.
@@ -388,6 +393,7 @@ Partial output is preferred whenever at least one meaningful subsystem succeeded
 ```text
 src/pbix_doc/
 ├── __main__.py
+├── bootstrap.py
 ├── cli.py
 ├── gui.py
 ├── pipeline.py
