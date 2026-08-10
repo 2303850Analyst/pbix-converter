@@ -315,7 +315,7 @@ def _set_cell_text(
     paragraph.paragraph_format.space_after = Pt(0)
     paragraph.paragraph_format.line_spacing = 1.05
     paragraph.paragraph_format.keep_with_next = bold
-    run = paragraph.add_run(clean_text(value, preserve_newlines=True, limit=4_000))
+    run = paragraph.add_run(clean_text(value, preserve_newlines=True, limit=None))
     _set_run_font(run, "Arial", font_size, color, bold=bold)
     if fill:
         shading = OxmlElement("w:shd")

@@ -1342,7 +1342,7 @@ def _scope_label(value: str | None) -> str:
     return labels.get(value, clean_text(value).replace("_", " ").lower())
 
 
-def clean_text(value: object, *, preserve_newlines: bool = False, limit: int = 4_000) -> str:
+def clean_text(value: object, *, preserve_newlines: bool = False, limit: int | None = 4_000) -> str:
     text = str(value or "")
     text = "".join(char for char in text if char in "\t\n\r" or ord(char) >= 32)
     if preserve_newlines:
@@ -1350,7 +1350,7 @@ def clean_text(value: object, *, preserve_newlines: bool = False, limit: int = 4
     else:
         text = " ".join(text.replace("\t", " ").splitlines())
     text = text.strip()
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+    return text if limit is None or len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def yes_no(value: bool | None) -> str:

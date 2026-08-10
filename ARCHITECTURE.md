@@ -38,7 +38,7 @@ The application:
 - installs process-wide Python audit guards at the production entry point, before GUI, controller, parser, or third-party analysis imports;
 - treats every runtime-policy violation as a fatal error that cannot be downgraded to partial extraction;
 - produces no permanent logs and does not include the absolute source path in the DOCX;
-- creates its extraction workspace beside the user-selected output, removes it normally, and removes abandoned application-owned workspaces on a later run;
+- creates its extraction workspace beside the user-selected output and verifies its removal before publication; a cleanup failure is fatal and prevents DOCX publication, while abandoned application-owned workspaces are retried on a later run;
 - keeps the atomic output temporary file beside the final DOCX.
 
 `NetworkEgressGuard` rejects Python socket creation, connection, DNS/service resolution, datagram sending, and `urllib` requests. Its purpose is to make accidental application or dependency network access fail closed. `ExternalProcessGuard` is a separate policy that rejects process-launch audit events so application code or a dependency cannot delegate transmission to another executable. Both violations use a dedicated fatal exit path.

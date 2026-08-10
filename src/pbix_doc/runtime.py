@@ -53,6 +53,10 @@ class ExternalProcessViolation(RuntimePolicyViolation):
     pass
 
 
+class WorkspaceCleanupViolation(RuntimePolicyViolation):
+    pass
+
+
 def install_runtime_guards() -> None:
     global _guards_installed
     if _guards_installed:
@@ -80,7 +84,16 @@ def managed_workspace(parent: Path) -> Iterator[Path]:
         workspace.joinpath(WORKSPACE_MARKER).write_text(json.dumps(marker), encoding="ascii")
         yield workspace
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        try:
+            shutil.rmtree(workspace)
+        except OSError as error:
+            raise WorkspaceCleanupViolation(
+                f"Не удалось удалить временную рабочую папку: {workspace.name}"
+            ) from error
+        if workspace.exists():
+            raise WorkspaceCleanupViolation(
+                f"Временная рабочая папка осталась после удаления: {workspace.name}"
+            )
 
 
 def cleanup_stale_artifacts(parent: Path) -> None:

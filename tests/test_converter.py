@@ -33,7 +33,7 @@ from pbix_doc.domain import (
 from pbix_doc.cli import build_parser, main
 from pbix_doc.pipeline import Options, generate_documentation, resolve_fields
 from pbix_doc.ooxml import UnsafeDocxError, validate_docx
-from pbix_doc.projector import HeadingBlock, SafeDocumentModel, project_document, sanitize_dax
+from pbix_doc.projector import HeadingBlock, SafeDocumentModel, TableBlock, project_document, sanitize_dax
 from pbix_doc.renderer import atomic_write, render_document
 from pbix_doc.report import parse_report
 from pbix_doc.runtime import (
@@ -41,10 +41,17 @@ from pbix_doc.runtime import (
     WORKSPACE_PREFIX,
     ExternalProcessViolation,
     NetworkEgressViolation,
+    WorkspaceCleanupViolation,
     cleanup_stale_artifacts,
     install_runtime_guards,
 )
-from pbix_doc.semantic import load_semantic_model, profile_examples, read_model_metadata, safe_error_message
+from pbix_doc.semantic import (
+    extract_native_types,
+    load_semantic_model,
+    profile_examples,
+    read_model_metadata,
+    safe_error_message,
+)
 
 
 def read_docx_text(payload: bytes | Path) -> str:
@@ -439,6 +446,20 @@ class RendererTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
             atomic_write(Path(directory, "legacy.txt"), first)
 
+    def test_table_renderer_does_not_silently_truncate_projected_text(self) -> None:
+        generated = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+        long_text = "DAX:" + "X" * 6_000
+        model = SafeDocumentModel(
+            "Отчёт",
+            "Описание",
+            "fixture.pbix",
+            generated,
+            "OK",
+            [TableBlock(("Выражение DAX",), [(long_text,)], (9_360,))],
+        )
+
+        self.assertIn(long_text, read_docx_text(render_document(model)))
+
     def test_ooxml_validator_rejects_external_relationship(self) -> None:
         generated = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
         payload = render_document(
@@ -496,6 +517,27 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(observed), 1)
         self.assertFalse(observed[0].exists())
         self.assertFalse(remaining)
+
+    def test_workspace_cleanup_failure_is_fatal_and_output_is_not_replaced(self) -> None:
+        def fake_model(_: Path, workspace: Path, __: int, ___: list) -> SemanticModelInfo:
+            workspace.joinpath("extracted.bin").write_bytes(b"temporary")
+            return SemanticModelInfo("NO_MODEL")
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory, "fixture.pbix")
+            output_path = Path(directory, "result.docx")
+            write_zip(input_path, pbir_parts())
+            output_path.write_bytes(b"existing output")
+            with (
+                patch("pbix_doc.pipeline.load_semantic_model", side_effect=fake_model),
+                patch("pbix_doc.runtime.shutil.rmtree", side_effect=OSError("locked")),
+                self.assertRaises(WorkspaceCleanupViolation),
+            ):
+                generate_documentation(input_path, output_path)
+            remaining = list(Path(directory).glob(f"{WORKSPACE_PREFIX}*"))
+
+            self.assertEqual(output_path.read_bytes(), b"existing output")
+            self.assertEqual(len(remaining), 1)
 
 
 class RuntimePolicyTests(unittest.TestCase):
@@ -659,6 +701,21 @@ class SemanticAdapterTests(unittest.TestCase):
         self.assertNotIn("server", repr(semantic))
         self.assertNotIn("SELECT CAST", repr(semantic))
         self.assertFalse(issues)
+
+    def test_native_types_are_read_only_from_native_query_and_type_steps(self) -> None:
+        expression = (
+            'let Note = "SELECT CAST(fake AS int) AS fake_alias", '
+            '// Value.NativeQuery(Db, "SELECT CAST(commented AS int) AS commented_alias")\n'
+            'Source = Value.NativeQuery(Sql.Database("server", "database"), '
+            '"SELECT CAST(amount AS decimal(18,2)) AS amount_net FROM dbo.sales"), '
+            'Unrelated = {{"fake_m", type text}}, '
+            'Typed = Table.TransformColumnTypes(Source,{{"amount_net", Currency.Type}}) in Typed'
+        )
+
+        self.assertEqual(
+            extract_native_types(expression),
+            {"amount_net": ["SQL: decimal(18,2)", "M: Currency.Type"]},
+        )
 
 
 if __name__ == "__main__":

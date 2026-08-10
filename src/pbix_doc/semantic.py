@@ -337,7 +337,6 @@ def native_query_column_types(rows: list[dict[str, Any]]) -> dict[tuple[str, str
 
 def extract_native_types(expression: str) -> dict[str, list[str]]:
     found: dict[str, list[str]] = defaultdict(list)
-    sql_text = expression.replace('""', '"')
     cast_pattern = re.compile(
         r"\bCAST\s*\(.*?\bAS\s+"
         r"([A-Za-z][A-Za-z0-9_ ]*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)\s*\)\s+AS\s+"
@@ -350,24 +349,160 @@ def extract_native_types(expression: str) -> dict[str, list[str]]:
         r"(?:\[([^\]]+)\]|\"([^\"]+)\"|`([^`]+)`|([A-Za-z_][A-Za-z0-9_$]*))",
         re.IGNORECASE | re.DOTALL,
     )
-    for pattern in (cast_pattern, convert_pattern):
-        for match in pattern.finditer(sql_text):
-            data_type = compact_metadata(match.group(1))
-            alias = next((value for value in match.groups()[1:] if value), None)
-            if alias and data_type:
-                _append_unique(found[compact_metadata(alias)], f"SQL: {data_type}")
+    uncommented = _mask_m_comments(expression)
+    for arguments in _function_call_arguments(uncommented, "Value.NativeQuery"):
+        if len(arguments) < 2:
+            continue
+        sql_text = _decode_m_string(arguments[1])
+        if sql_text is None:
+            continue
+        for pattern in (cast_pattern, convert_pattern):
+            for match in pattern.finditer(sql_text):
+                data_type = compact_metadata(match.group(1))
+                alias = next((value for value in match.groups()[1:] if value), None)
+                if alias and data_type:
+                    _append_unique(found[compact_metadata(alias)], f"SQL: {data_type}")
 
     m_type_pattern = re.compile(
         r'\{\s*"((?:[^\"]|\"\")+)"\s*,\s*'
         r'((?:type\s+(?:nullable\s+)?)?[A-Za-z_][A-Za-z0-9_.]*)\s*\}',
         re.IGNORECASE,
     )
-    for match in m_type_pattern.finditer(expression):
-        column = compact_metadata(match.group(1).replace('""', '"'))
-        data_type = compact_metadata(match.group(2))
-        if column and data_type:
-            _append_unique(found[column], f"M: {data_type}")
+    for arguments in _function_call_arguments(uncommented, "Table.TransformColumnTypes"):
+        if len(arguments) < 2:
+            continue
+        for match in m_type_pattern.finditer(arguments[1]):
+            column = compact_metadata(match.group(1).replace('""', '"'))
+            data_type = compact_metadata(match.group(2))
+            if column and data_type:
+                _append_unique(found[column], f"M: {data_type}")
     return dict(found)
+
+
+def _mask_m_comments(expression: str) -> str:
+    output: list[str] = []
+    index = 0
+    state = "CODE"
+    while index < len(expression):
+        current = expression[index]
+        following = expression[index + 1] if index + 1 < len(expression) else ""
+        if state == "STRING":
+            output.append(current)
+            if current == '"' and following == '"':
+                output.append(following)
+                index += 2
+                continue
+            if current == '"':
+                state = "CODE"
+        elif state == "LINE_COMMENT":
+            output.append("\n" if current == "\n" else " ")
+            if current == "\n":
+                state = "CODE"
+        elif state == "BLOCK_COMMENT":
+            if current == "*" and following == "/":
+                output.extend((" ", " "))
+                index += 2
+                state = "CODE"
+                continue
+            output.append("\n" if current == "\n" else " ")
+        elif current == '"':
+            output.append(current)
+            state = "STRING"
+        elif current == "/" and following == "/":
+            output.extend((" ", " "))
+            index += 2
+            state = "LINE_COMMENT"
+            continue
+        elif current == "/" and following == "*":
+            output.extend((" ", " "))
+            index += 2
+            state = "BLOCK_COMMENT"
+            continue
+        else:
+            output.append(current)
+        index += 1
+    return "".join(output)
+
+
+def _function_call_arguments(expression: str, function_name: str) -> list[list[str]]:
+    calls: list[list[str]] = []
+    pattern = re.compile(rf"(?<![\w.]){re.escape(function_name)}\s*\(", re.IGNORECASE)
+    searchable = _mask_m_strings(expression)
+    for match in pattern.finditer(searchable):
+        arguments: list[str] = []
+        start = match.end()
+        index = start
+        parentheses = 1
+        braces = 0
+        brackets = 0
+        in_string = False
+        while index < len(expression):
+            current = expression[index]
+            following = expression[index + 1] if index + 1 < len(expression) else ""
+            if in_string:
+                if current == '"' and following == '"':
+                    index += 2
+                    continue
+                if current == '"':
+                    in_string = False
+                index += 1
+                continue
+            if current == '"':
+                in_string = True
+            elif current == "(":
+                parentheses += 1
+            elif current == ")":
+                parentheses -= 1
+                if parentheses == 0:
+                    arguments.append(expression[start:index].strip())
+                    calls.append(arguments)
+                    break
+            elif current == "{":
+                braces += 1
+            elif current == "}":
+                braces = max(0, braces - 1)
+            elif current == "[":
+                brackets += 1
+            elif current == "]":
+                brackets = max(0, brackets - 1)
+            elif current == "," and parentheses == 1 and braces == 0 and brackets == 0:
+                arguments.append(expression[start:index].strip())
+                start = index + 1
+            index += 1
+    return calls
+
+
+def _mask_m_strings(expression: str) -> str:
+    output: list[str] = []
+    index = 0
+    in_string = False
+    while index < len(expression):
+        current = expression[index]
+        following = expression[index + 1] if index + 1 < len(expression) else ""
+        if not in_string:
+            if current == '"':
+                in_string = True
+                output.append(" ")
+            else:
+                output.append(current)
+            index += 1
+            continue
+        output.append("\n" if current == "\n" else " ")
+        if current == '"' and following == '"':
+            output.append(" ")
+            index += 2
+            continue
+        if current == '"':
+            in_string = False
+        index += 1
+    return "".join(output)
+
+
+def _decode_m_string(argument: str) -> str | None:
+    value = argument.strip()
+    if len(value) < 2 or not value.startswith('"') or not value.endswith('"'):
+        return None
+    return value[1:-1].replace('""', '"')
 
 
 def compact_metadata(value: Any, limit: int = 160) -> str:
