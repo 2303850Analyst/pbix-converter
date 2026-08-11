@@ -17,6 +17,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 from .ooxml import validate_docx
 from .projector import (
+    CodeBlock,
     HeadingBlock,
     ListBlock,
     ParagraphBlock,
@@ -49,6 +50,8 @@ def render_document(model: SafeDocumentModel) -> bytes:
             _add_heading(document, block)
         elif isinstance(block, ParagraphBlock):
             _add_paragraph(document, block)
+        elif isinstance(block, CodeBlock):
+            _add_code_block(document, block)
         elif isinstance(block, ListBlock):
             _add_list(document, block)
         elif isinstance(block, TableBlock):
@@ -192,6 +195,17 @@ def _add_paragraph(document: DocumentObject, block: ParagraphBlock) -> None:
         color=color,
         bold=block.kind == "status",
     )
+
+
+def _add_code_block(document: DocumentObject, block: CodeBlock) -> None:
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.space_before = Pt(1)
+    paragraph.paragraph_format.space_after = Pt(4)
+    paragraph.paragraph_format.left_indent = Inches(0.12)
+    paragraph.paragraph_format.right_indent = Inches(0.12)
+    _shade_paragraph(paragraph, LIGHT_GRAY)
+    run = paragraph.add_run(clean_text(block.text, preserve_newlines=True, limit=None))
+    _set_run_font(run, "Consolas", 8, "000000")
 
 
 def _add_list(document: DocumentObject, block: ListBlock) -> None:

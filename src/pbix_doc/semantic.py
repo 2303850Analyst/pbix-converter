@@ -9,6 +9,7 @@ from typing import Any
 
 from .domain import (
     ColumnInfo,
+    ConnectionInfo,
     Issue,
     MeasureInfo,
     QueryInfo,
@@ -182,13 +183,15 @@ def load_semantic_model(
             return result
     except LiveConnectionError as error:
         result = empty_model("LIVE_CONNECTION")
+        connection_rows = records(getattr(error, "connections", []))
         result.connection_types = sorted(
             {
                 str(item.get("connectionType") or item.get("ConnectionType") or "LIVE")
-                for item in getattr(error, "connections", [])
+                for item in connection_rows
                 if isinstance(item, dict)
             }
         )
+        result.connections = extract_model_connections(connection_rows)
         issues.append(
             Issue(
                 "INFO",
@@ -223,6 +226,7 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
     calculated_rows = safe_records(model, "dax_columns", issues)
     power_query_rows = safe_records(model, "power_query", issues)
     mashup_query_rows = optional_records(model, "mashup_queries", issues)
+    connection_rows = optional_records(model, "connections", issues)
     query_rows = deduplicate_query_rows(power_query_rows + mashup_query_rows)
     native_types = native_query_column_types(query_rows)
 
@@ -332,18 +336,33 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
         if name:
             expression = text_or_none(rget(row, "Expression"))
             connectors = extract_power_query_connection_types(expression or "")
+            source_details, connection_strings = extract_power_query_source_metadata(
+                expression or ""
+            )
+            safe_expression = redact_connection_secrets(expression) if expression else None
             existing = queries_by_name.get(name.casefold())
             if existing:
                 existing.expression_available = existing.expression_available or bool(expression)
                 existing.connection_types = sorted(
                     set(existing.connection_types) | set(connectors), key=str.casefold
                 )
+                existing.source_details = list(
+                    dict.fromkeys(existing.source_details + source_details)
+                )
+                existing.connection_strings = list(
+                    dict.fromkeys(existing.connection_strings + connection_strings)
+                )
+                if safe_expression and safe_expression not in existing.expressions:
+                    existing.expressions.append(safe_expression)
             else:
                 queries_by_name[name.casefold()] = QueryInfo(
                     name,
                     text_or_none(rget(row, "Kind")) or "POWER_QUERY",
                     bool(expression),
                     connectors,
+                    source_details,
+                    connection_strings,
+                    [safe_expression] if safe_expression else [],
                 )
     queries = list(queries_by_name.values())
 
@@ -375,7 +394,7 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
 
     connection_types = {
         compact_metadata(rget(item, "connectionType", "ConnectionType", "Type"))
-        for item in records(getattr(model, "connections", []))
+        for item in connection_rows
     }
     connection_types.discard("")
     for query in queries:
@@ -390,6 +409,7 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
         ols,
         sorted(connection_types, key=str.casefold),
         package_version(),
+        extract_model_connections(connection_rows),
     )
 
 
@@ -484,6 +504,47 @@ POWER_QUERY_CONNECTORS = {
     "file.contents": "Файл",
 }
 
+POWER_QUERY_SOURCE_ARGUMENTS = {
+    "sql.database": (("Сервер", 0), ("База", 1)),
+    "oracle.database": (("Сервер / подключение", 0),),
+    "postgresql.database": (("Сервер", 0), ("База", 1)),
+    "mysql.database": (("Сервер", 0), ("База", 1)),
+    "snowflake.databases": (("Сервер", 0), ("Хранилище", 1)),
+    "teradata.database": (("Сервер", 0),),
+    "analysisservices.database": (("Сервер", 0), ("База", 1)),
+    "amazonredshift.database": (("Сервер", 0), ("База", 1)),
+    "saphana.database": (("Сервер", 0),),
+    "googlebigquery.database": (("Проект", 0),),
+    "databricks.catalogs": (("Сервер", 0), ("HTTP path", 1)),
+    "sharepoint.files": (("URL", 0),),
+    "sharepoint.contents": (("URL", 0),),
+    "azurestorage.blobs": (("Источник", 0),),
+    "azurestorage.datalake": (("Источник", 0),),
+    "web.contents": (("URL", 0),),
+    "folder.files": (("Путь", 0),),
+    "folder.contents": (("Путь", 0),),
+    "file.contents": (("Путь", 0),),
+}
+
+POWER_QUERY_CONNECTION_ARGUMENTS = {
+    "odbc.datasource": (0,),
+    "odbc.query": (0,),
+    "oledb.datasource": (0,),
+}
+
+SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?P<prefix>(?<![\w])[\"']?(?:password|pwd|passphrase|token|access[_ ]?token|"
+    r"refresh[_ ]?token|client[_ ]?secret|api[_ ]?key|subscription[_ ]?key|"
+    r"account[_ ]?key|private[_ ]?key|secret[_ ]?key|access[_ ]?key|"
+    r"shared[_ ]?access[_ ]?signature|sas|sig|authorization)[\"']?"
+    r"\s*(?:=|:)\s*)"
+    r"(?P<value>\"(?:[^\"]|\"\")*\"|'[^']*'|[^;,&\]\}\)\r\n\"']+)",
+)
+
+URL_PASSWORD_PATTERN = re.compile(
+    r"(?i)(https?://[^:/\s\"]+:)([^@/\s\"]+)(@)"
+)
+
 
 def extract_power_query_connection_types(expression: str) -> list[str]:
     if not expression:
@@ -497,6 +558,112 @@ def extract_power_query_connection_types(expression: str) -> list[str]:
         {POWER_QUERY_CONNECTORS[name] for name in functions if name in POWER_QUERY_CONNECTORS},
         key=str.casefold,
     )
+
+
+def extract_power_query_source_metadata(expression: str) -> tuple[list[str], list[str]]:
+    if not expression:
+        return [], []
+    uncommented = _mask_m_comments(expression)
+    details: list[str] = []
+    connection_strings: list[str] = []
+    for function_name, labels in POWER_QUERY_SOURCE_ARGUMENTS.items():
+        for arguments in _function_call_arguments(uncommented, function_name):
+            parts = []
+            for label, index in labels:
+                if index >= len(arguments):
+                    continue
+                value = _decode_m_string(arguments[index])
+                if value is not None:
+                    parts.append(f"{label}: {redact_connection_secrets(value)}")
+            if parts:
+                _append_unique(details, "; ".join(parts))
+    for function_name, indexes in POWER_QUERY_CONNECTION_ARGUMENTS.items():
+        for arguments in _function_call_arguments(uncommented, function_name):
+            for index in indexes:
+                if index >= len(arguments):
+                    continue
+                value = _decode_m_string(arguments[index])
+                if value is not None:
+                    _append_unique(
+                        connection_strings,
+                        redact_connection_secrets(value),
+                    )
+    return details, connection_strings
+
+
+def redact_connection_secrets(value: str | None) -> str:
+    text = str(value or "")
+
+    def replace_assignment(match: re.Match[str]) -> str:
+        original = match.group("value")
+        if original.startswith('"'):
+            replacement = '"<СКРЫТО>"'
+        elif original.startswith("'"):
+            replacement = "'<СКРЫТО>'"
+        else:
+            replacement = "<СКРЫТО>"
+        return match.group("prefix") + replacement
+
+    text = SECRET_ASSIGNMENT_PATTERN.sub(replace_assignment, text)
+    return URL_PASSWORD_PATTERN.sub(r"\1<СКРЫТО>\3", text)
+
+
+def extract_model_connections(rows: list[dict[str, Any]]) -> list[ConnectionInfo]:
+    result: list[ConnectionInfo] = []
+    seen: set[tuple[str, tuple[str, ...], str]] = set()
+    for row in rows:
+        connection_type = first_named_scalar(row, ("connectionType", "type", "kind"))
+        details: list[str] = []
+        for label, names in (
+            ("Сервер", ("server", "serverName", "host", "hostname")),
+            ("База", ("database", "databaseName", "initialCatalog", "catalog")),
+            ("Путь", ("path", "filePath", "folderPath", "location")),
+            ("URL", ("url", "uri", "endpoint")),
+            ("Источник", ("dataSource", "datasource", "dsn")),
+        ):
+            for value in named_scalars(row, names):
+                _append_unique(details, f"{label}: {redact_connection_secrets(value)}")
+        strings = named_scalars(
+            row,
+            ("connectionString", "connection_string", "providerString"),
+        )
+        connection_string = (
+            " | ".join(dict.fromkeys(redact_connection_secrets(value) for value in strings))
+            if strings
+            else None
+        )
+        key = (
+            (connection_type or "").casefold(),
+            tuple(details),
+            connection_string or "",
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(ConnectionInfo(connection_type, details, connection_string))
+    return result
+
+
+def named_scalars(node: Any, names: tuple[str, ...]) -> list[str]:
+    wanted = {name.casefold() for name in names}
+    result: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if str(key).casefold() in wanted and isinstance(value, (str, int, float)):
+                _append_unique(result, str(value))
+            if isinstance(value, (dict, list)):
+                for nested in named_scalars(value, names):
+                    _append_unique(result, nested)
+    elif isinstance(node, list):
+        for value in node:
+            for nested in named_scalars(value, names):
+                _append_unique(result, nested)
+    return result
+
+
+def first_named_scalar(node: Any, names: tuple[str, ...]) -> str | None:
+    values = named_scalars(node, names)
+    return values[0] if values else None
 
 
 def extract_native_types(expression: str) -> dict[str, list[str]]:

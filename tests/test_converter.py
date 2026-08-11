@@ -26,6 +26,7 @@ from docx.enum.section import WD_ORIENT
 from pbix_doc.container import PbixContainer, UnsupportedPbixError
 from pbix_doc.domain import (
     ColumnInfo,
+    ConnectionInfo,
     DocumentationModel,
     FieldRef,
     FileInfo,
@@ -41,7 +42,14 @@ from pbix_doc.cli import build_parser, main
 from pbix_doc.pipeline import Options, generate_documentation, resolve_fields
 from pbix_doc.policy import METADATA_EXCLUSION_POLICY
 from pbix_doc.ooxml import UnsafeDocxError, validate_docx
-from pbix_doc.projector import HeadingBlock, SafeDocumentModel, TableBlock, project_document, sanitize_dax
+from pbix_doc.projector import (
+    CodeBlock,
+    HeadingBlock,
+    SafeDocumentModel,
+    TableBlock,
+    project_document,
+    sanitize_dax,
+)
 from pbix_doc.renderer import atomic_write, render_document
 from pbix_doc.report import (
     aggregation_name,
@@ -62,10 +70,12 @@ from pbix_doc.runtime import (
 )
 from pbix_doc.semantic import (
     extract_power_query_connection_types,
+    extract_power_query_source_metadata,
     extract_native_types,
     load_semantic_model,
     profile_examples,
     read_model_metadata,
+    redact_connection_secrets,
     safe_error_message,
     normalize_summarize_by,
     normalize_model_data_type,
@@ -540,9 +550,31 @@ class RendererTests(unittest.TestCase):
                         None,
                     )
                 ],
-                queries=[QueryInfo("H$Storage", "POWER_QUERY", True)],
+                queries=[
+                    QueryInfo("H$Storage", "POWER_QUERY", True),
+                    QueryInfo(
+                        "Sales Import",
+                        "POWER_QUERY",
+                        True,
+                        ["SQL Server"],
+                        ["Сервер: srv01; База: DWH"],
+                        ["Server=srv01;Database=DWH;Password=<СКРЫТО>"],
+                        [
+                            'let Source = Sql.Database("srv01", "DWH"), '
+                            'Data = Value.NativeQuery(Source, "SELECT amount FROM dbo.sales") '
+                            'in Data'
+                        ],
+                    ),
+                ],
                 rls=[SecurityRule("RLS", "Internal", "R$Relationship", None, "TRUE()", "Read")],
                 ols=[SecurityRule("OLS", "Internal", "U$Hierarchy", "Index", None, "None")],
+                connections=[
+                    ConnectionInfo(
+                        "SQL Server",
+                        ["Сервер: srv01", "База: DWH"],
+                        "Server=srv01;Database=DWH;Password=<СКРЫТО>",
+                    )
+                ],
             )
             resolve_fields(report.pages, semantic, issues)
             model = DocumentationModel(
@@ -588,6 +620,12 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn("U$Hierarchy", text)
         self.assertIn("Uses internal storage", text)
         self.assertIn("<СЛУЖЕБНАЯ ССЫЛКА>", text)
+        self.assertIn("Сервер / база / путь", text)
+        self.assertIn("Строка подключения", text)
+        self.assertIn("M-код: запрос «Sales Import»", text)
+        self.assertIn('Sql.Database("srv01", "DWH")', text)
+        self.assertIn("SELECT amount FROM dbo.sales", text)
+        self.assertIn("Password=<СКРЫТО>", text)
         self.assertNotIn("RLS и OLS — формальная заглушка", text)
         self.assertNotIn("Статус анализа: PROVISIONAL", text)
         self.assertNotIn("Диагностика извлечения", text)
@@ -835,6 +873,20 @@ class RendererTests(unittest.TestCase):
             generated,
             "OK",
             [TableBlock(("Выражение DAX",), [(long_text,)], (9_360,))],
+        )
+
+        self.assertIn(long_text, read_docx_text(render_document(model)))
+
+    def test_code_renderer_does_not_truncate_power_query(self) -> None:
+        generated = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+        long_text = "let Source = \"" + "X" * 13_000 + "\" in Source_END"
+        model = SafeDocumentModel(
+            "Отчёт",
+            "Описание",
+            "fixture.pbix",
+            generated,
+            "OK",
+            [CodeBlock(long_text)],
         )
 
         self.assertIn(long_text, read_docx_text(render_document(model)))
@@ -1095,7 +1147,7 @@ class SemanticAdapterTests(unittest.TestCase):
                 self.assertEqual(normalize_model_data_type(str(code)), name)
         self.assertIsNone(normalize_model_data_type(99))
 
-    def test_native_query_names_and_types_are_normalized_without_retaining_query(self) -> None:
+    def test_native_query_names_types_and_full_code_are_retained(self) -> None:
         class FakeModel:
             tmschema_tables = [{"Name": "Sales", "IsHidden": False, "StorageMode": "Import"}]
             tmschema_columns = [
@@ -1139,8 +1191,12 @@ class SemanticAdapterTests(unittest.TestCase):
         self.assertEqual(column.summarize_by, "SUM")
         self.assertEqual(semantic.queries[0].connection_types, ["SQL Server"])
         self.assertEqual(semantic.connection_types, ["SQL Server"])
-        self.assertNotIn("server", repr(semantic))
-        self.assertNotIn("SELECT CAST", repr(semantic))
+        self.assertEqual(
+            semantic.queries[0].source_details,
+            ["Сервер: server; База: database"],
+        )
+        self.assertIn("server", semantic.queries[0].expressions[0])
+        self.assertIn("SELECT CAST", semantic.queries[0].expressions[0])
         self.assertFalse(issues)
 
     def test_native_types_are_read_only_from_native_query_and_type_steps(self) -> None:
@@ -1166,6 +1222,36 @@ class SemanticAdapterTests(unittest.TestCase):
         self.assertEqual(
             extract_power_query_connection_types(expression),
             ["Excel", "SQL Server", "Файл"],
+        )
+
+    def test_power_query_sources_are_extracted_and_secrets_are_redacted(self) -> None:
+        expression = (
+            'let Db = Odbc.DataSource("Driver=X;Server=srv;Pwd=plain password;Token=abc"), '
+            'ApiKey = "key-123", '
+            'Web = Web.Contents("https://user:pass@host/path?sig=signature&x=1") in Db'
+        )
+        sanitized = redact_connection_secrets(expression)
+        details, connection_strings = extract_power_query_source_metadata(expression)
+
+        for secret in ("plain password", "abc", "key-123", "pass", "signature"):
+            self.assertNotIn(secret, sanitized)
+            self.assertNotIn(secret, repr((details, connection_strings)))
+        self.assertGreaterEqual(sanitized.count("<СКРЫТО>"), 5)
+        self.assertEqual(
+            connection_strings,
+            ["Driver=X;Server=srv;Pwd=<СКРЫТО>;Token=<СКРЫТО>"],
+        )
+
+        json_like = redact_connection_secrets(
+            '\"api_key\": \"json-secret\"; PrivateKey=\"private-secret\"; AccessKey=plain-secret'
+        )
+        self.assertNotIn("json-secret", json_like)
+        self.assertNotIn("private-secret", json_like)
+        self.assertNotIn("plain-secret", json_like)
+        self.assertEqual(json_like.count("<СКРЫТО>"), 3)
+        self.assertEqual(
+            details,
+            ["URL: https://user:<СКРЫТО>@host/path?sig=<СКРЫТО>&x=1"],
         )
 
     def test_mashup_queries_are_included_and_parameters_are_skipped(self) -> None:
@@ -1201,7 +1287,39 @@ class SemanticAdapterTests(unittest.TestCase):
 
         self.assertEqual([query.name for query in semantic.queries], ["Sales"])
         self.assertEqual(semantic.queries[0].connection_types, ["ODBC"])
-        self.assertNotIn("private", repr(semantic))
+        self.assertEqual(semantic.queries[0].connection_strings, ["dsn=private"])
+        self.assertIn("dsn=private", semantic.queries[0].expressions[0])
+
+    def test_model_connection_metadata_is_retained_with_secret_redaction(self) -> None:
+        class FakeModel:
+            tmschema_tables: list[dict[str, object]] = []
+            tmschema_columns: list[dict[str, object]] = []
+            schema: list[dict[str, object]] = []
+            statistics: list[dict[str, object]] = []
+            dax_columns: list[dict[str, object]] = []
+            tables: list[dict[str, object]] = []
+            dax_measures: list[dict[str, object]] = []
+            relationships: list[dict[str, object]] = []
+            power_query: list[dict[str, object]] = []
+            rls: list[dict[str, object]] = []
+            ols: list[dict[str, object]] = []
+            connections = [
+                {
+                    "connectionType": "SQL Server",
+                    "server": "srv01",
+                    "database": "DWH",
+                    "connectionString": "Server=srv01;Database=DWH;Pwd=plain-secret",
+                }
+            ]
+
+        semantic = read_model_metadata(FakeModel(), [])
+
+        self.assertEqual(semantic.connections[0].source_details, ["Сервер: srv01", "База: DWH"])
+        self.assertEqual(
+            semantic.connections[0].connection_string,
+            "Server=srv01;Database=DWH;Pwd=<СКРЫТО>",
+        )
+        self.assertNotIn("plain-secret", repr(semantic))
 
 
 if __name__ == "__main__":

@@ -49,6 +49,11 @@ class ParagraphBlock:
 
 
 @dataclass(slots=True)
+class CodeBlock:
+    text: str
+
+
+@dataclass(slots=True)
 class ListBlock:
     items: list[str]
     ordered: bool = False
@@ -68,7 +73,7 @@ class SectionBreakBlock:
     orientation: str
 
 
-DocumentBlock = HeadingBlock | ParagraphBlock | ListBlock | TableBlock | SectionBreakBlock
+DocumentBlock = HeadingBlock | ParagraphBlock | CodeBlock | ListBlock | TableBlock | SectionBreakBlock
 
 
 @dataclass(slots=True)
@@ -1109,42 +1114,70 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
     blocks.append(HeadingBlock(2, "Power Query и подключения"))
     queries = [item for item in semantic.queries if not _is_excluded_metadata(item.name)]
     if queries:
+        shown_queries = queries[:MAX_TABLE_ROWS]
         blocks.append(
             TableBlock(
-                ("Запрос", "Тип", "Подключение", "M-код"),
+                (
+                    "Запрос",
+                    "Тип",
+                    "Коннектор",
+                    "Сервер / база / путь",
+                    "Строка подключения",
+                ),
                 [
                     (
                         f"запрос {_entity_name(item.name, 'Запрос без названия')}",
                         _query_kind_label(item.kind),
                         ", ".join(item.connection_types) or "—",
-                        "Найден; текст не выводится" if item.expression_available else "—",
+                        "; ".join(item.source_details) or "—",
+                        " | ".join(item.connection_strings) or "—",
                     )
-                    for item in queries[:MAX_TABLE_ROWS]
+                    for item in shown_queries
                 ],
-                (2_500, 1_700, 2_200, 2_960),
+                (2_300, 1_500, 1_900, 4_100, 4_600),
+                font_size=7.2,
+                allow_row_split=True,
             )
         )
-        assigned_connections = {
-            connection
-            for query in queries
-            for connection in query.connection_types
-        }
-        unassigned_connections = [
-            value
-            for value in semantic.connection_types
-            if value not in assigned_connections
-        ]
-        if unassigned_connections:
-            blocks.append(
-                ParagraphBlock(
-                    "Подключения модели без однозначной привязки к запросу: "
-                    + ", ".join(clean_text(value) for value in unassigned_connections),
-                    "note",
+        if len(queries) > len(shown_queries):
+            blocks.append(ParagraphBlock(OVERFLOW, "warning"))
+        for query in shown_queries:
+            for index, expression in enumerate(query.expressions, 1):
+                suffix = f" — вариант {index}" if len(query.expressions) > 1 else ""
+                blocks.extend(
+                    [
+                        HeadingBlock(
+                            3,
+                            f"M-код: запрос «{clean_text(query.name)}»{suffix}",
+                        ),
+                        CodeBlock(expression),
+                    ]
                 )
-            )
     else:
         blocks.append(ParagraphBlock("Метаданные Power Query не найдены или недоступны."))
-    if not queries:
+    if semantic.connections:
+        blocks.extend(
+            [
+                HeadingBlock(3, "Подключения модели"),
+                TableBlock(
+                    ("Тип", "Сервер / база / путь", "Строка подключения"),
+                    [
+                        (
+                            _display_or_dash(item.connection_type),
+                            "; ".join(item.source_details) or "—",
+                            clean_text(item.connection_string) or "—",
+                        )
+                        for item in semantic.connections[:MAX_TABLE_ROWS]
+                    ],
+                    (2_200, 5_300, 6_900),
+                    font_size=7.5,
+                    allow_row_split=True,
+                ),
+            ]
+        )
+        if len(semantic.connections) > MAX_TABLE_ROWS:
+            blocks.append(ParagraphBlock(OVERFLOW, "warning"))
+    elif not queries:
         blocks.append(
             ParagraphBlock(
                 "Типы подключений: "

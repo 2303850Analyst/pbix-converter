@@ -182,6 +182,16 @@ class QueryInfo:
     kind: str
     expression_available: bool
     connection_types: list[str] = field(default_factory=list)
+    source_details: list[str] = field(default_factory=list)
+    connection_strings: list[str] = field(default_factory=list)
+    expressions: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ConnectionInfo:
+    connection_type: str | None
+    source_details: list[str] = field(default_factory=list)
+    connection_string: str | None = None
 
 
 @dataclass(slots=True)
@@ -205,6 +215,7 @@ class SemanticModelInfo:
     ols: list[SecurityRule] = field(default_factory=list)
     connection_types: list[str] = field(default_factory=list)
     library_version: str | None = None
+    connections: list[ConnectionInfo] = field(default_factory=list)
 
 
 @dataclass(slots=True)

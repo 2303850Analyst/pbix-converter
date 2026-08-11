@@ -73,7 +73,7 @@ CLI / Controller
 
 `DocumentProjector` receives the normalized and policy-safe domain model and derives the field registry, page-grouped composition, unified bookmark/navigation and filter registers, same-name comparison groups, explicit context evidence, and document-local references. The DOCX renderer receives only `SafeDocumentModel`. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, the normalized PBIX model, or unsanitized values.
 
-Immediately after the compact report overview, the projector emits a single field registry. It combines every locally discovered semantic column, measure, calculated column, report field reference, filter reference, visual usage, aggregation, and DAX dependency. NativeQuery is never executed or copied into the safe document model: the semantic adapter retains only normalized source-column names and data-type declarations extracted from model metadata, SQL `CAST`/`CONVERT`, or Power Query type steps.
+Immediately after the compact report overview, the projector emits a single field registry. It combines every locally discovered semantic column, measure, calculated column, report field reference, filter reference, visual usage, aggregation, and DAX dependency. NativeQuery and Power Query are never executed. Their locally stored definitions may enter the safe document model and DOCX as explicitly approved metadata code after recognized credentials, tokens, API keys, client secrets, and SAS signatures are replaced with `<СКРЫТО>`.
 
 ## 3. Input handling
 
@@ -154,7 +154,7 @@ Default policy:
 |---|---|
 | Categorical text | Up to five most frequent values |
 | Boolean | Up to two values |
-| Low-cardinality numeric category | Up to five values |
+| Numeric, including low-cardinality numeric category | Hidden |
 | Continuous numeric | Hidden |
 | Date/time | Hidden by default |
 | ID, key, GUID, account, phone, email | Hidden |
@@ -179,7 +179,7 @@ Identifiers and keys:           hidden
 Categorical examples:           maximum five
 Connection secrets:             removed
 DAX definitions:                included as explicitly approved metadata code
-Power Query definitions:        included only after sanitization
+Power Query/NativeQuery code:   included in full after secret-value redaction
 ```
 
 Report object counts, coordinates, model cardinality, technical versions, and other metadata are not treated as business fact values.
@@ -219,7 +219,7 @@ DocumentationModel
 
 Every field use retains its report scope, usage type, page/visual ID, role, aggregation, evidence path, and resolution status.
 
-Each normalized semantic column may additionally retain `format_string`, `source_column`, `native_data_type`, and `summarize_by`. These are metadata only. Raw Power Query, SQL text, server/database literals, credentials, and connection strings do not enter the safe document model.
+Each normalized semantic column may additionally retain `format_string`, `source_column`, `native_data_type`, and `summarize_by`. These are metadata only. A normalized query may retain its full secret-redacted M/NativeQuery definitions, connector classes, server/database/path metadata, and secret-redacted connection strings. Recognized passwords, tokens, API keys, client secrets, account keys, authorization values, URL passwords, and SAS signatures must never enter the safe document model in clear text.
 
 ### 8.1 Document projection and evidence taxonomy
 
@@ -432,7 +432,7 @@ The document starts with the compact report overview; no separate cover page is 
 
 `Состав листа` immediately follows the field registry. Each page has its own heading and an eight-column table: element, name, type/purpose, fields/measures, calculation/DAX, context/filters, related bookmarks, and action/target. Visual filter context is rendered only as scope plus qualified field (`Фильтр листа по полю Table[Field]`); saved literals are centralized in `Все фильтры`. Filter literals are extracted from the semantic condition subtree rather than from the whole visual configuration, and known condition operators are rendered in user-facing language. The `Элемент` column contains only the local ID. The following `Переходы и действия (Все закладки)` table is the single navigation register. Bookmark rows document associated pages, entry points, affected elements, saved scope, and user-visible effect. Non-bookmark rows document page, Tooltip, drillthrough, and other navigation targets; bookmark-navigation edges are not duplicated. `Все фильтры` documents report, page, and visual filters with their qualified fields, condition/type, saved values, scope of application, related bookmarks, and extraction status.
 
-Power Query discovery reads both PBIXRay `power_query` and optional DataMashup `mashup_queries` metadata. The safe model retains only query name, query kind, expression-presence flag, and recognized connector class. Raw M, SQL, server/database identifiers, file paths, credentials, and connection strings are discarded before projection.
+Power Query discovery reads both PBIXRay `power_query` and optional DataMashup `mashup_queries` metadata. The safe model retains query name, query kind, recognized connector class, server/database/path metadata, secret-redacted connection strings, and complete secret-redacted M/NativeQuery definitions. The DOCX first renders a compact connection register and then a monospaced code block for every available definition. These definitions are copied as metadata and are never evaluated. Output is still bounded by the validated OOXML package limits; no application network request or external process is introduced.
 
 The DOCX does not expose the PBIX SHA-256, component/library versions, or the internal value-profile name. Calculation DAX remains available in the field registry and page composition; no separate KPI/calculation catalog is emitted.
 
