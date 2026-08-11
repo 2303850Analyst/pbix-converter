@@ -656,9 +656,9 @@ def _composition_context(
     page: PageInfo,
     visual: VisualInfo,
 ) -> str:
-    items = [_filter_context_text(item) for item in model.report.report_filters]
-    items.extend(_filter_context_text(item) for item in page.filters)
-    items.extend(_filter_context_text(item) for item in visual.filters)
+    items = [_filter_reference_text(item) for item in model.report.report_filters]
+    items.extend(_filter_reference_text(item) for item in page.filters)
+    items.extend(_filter_reference_text(item) for item in visual.filters)
     return "; ".join(dict.fromkeys(clean_text(item) for item in items)) or "—"
 
 
@@ -1599,6 +1599,10 @@ def _filter_context_text(item: FilterInfo) -> str:
         f"({_filter_type_label(item.filter_type)}); "
         f"значения: {_saved_values_text(item.saved_values, item.saved_value_count)}"
     )
+
+
+def _filter_reference_text(item: FilterInfo) -> str:
+    return f"{_filter_scope_label(item.scope)}: {clean_text(item.field)}"
 
 
 def _saved_values_text(values: Iterable[str], count: int) -> str:

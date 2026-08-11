@@ -29,6 +29,7 @@ from pbix_doc.domain import (
     DocumentationModel,
     FieldRef,
     FileInfo,
+    FilterInfo,
     MeasureInfo,
     SemanticModelInfo,
     TableInfo,
@@ -366,6 +367,16 @@ class RendererTests(unittest.TestCase):
                     "synthetic-regression",
                 )
             )
+            report.pages[0].filters.append(
+                FilterInfo(
+                    "PAGE",
+                    "Sales[Region]",
+                    "Categorical",
+                    2,
+                    "synthetic-regression",
+                    ["null", "true"],
+                )
+            )
             semantic = SemanticModelInfo(
                 "EMBEDDED",
                 tables=[
@@ -545,6 +556,13 @@ class RendererTests(unittest.TestCase):
         self.assertIn("CALCULATE", composition_rows["V002"].cells[5].text)
         self.assertIn('"<VALUE>"', composition_rows["V002"].cells[5].text)
         self.assertIn("Вернуть обзор (V004)", composition_rows["B01"].cells[8].text)
+        self.assertEqual(
+            composition_rows["V001"].cells[6].text,
+            "Фильтр отчёта: Sales[Region]; Фильтр листа: Sales[Region]",
+        )
+        self.assertNotIn("Пусто", composition_rows["V001"].cells[6].text)
+        self.assertNotIn("Да", composition_rows["V001"].cells[6].text)
+        self.assertNotIn("Категориальный", composition_rows["V001"].cells[6].text)
         self.assertTrue(all(row.cells[3].text == "" for row in registry.rows[1:]))
         self.assertFalse(any(name.casefold().startswith("local") for name in registry_rows))
         self.assertEqual(registry_rows["Sales[Region]"].cells[2].text, "String")
