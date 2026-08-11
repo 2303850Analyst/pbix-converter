@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from pbix_doc.container import PbixContainer, UnsupportedPbixError
 from pbix_doc.domain import (
     ColumnInfo,
     DocumentationModel,
+    FieldRef,
     FileInfo,
     MeasureInfo,
     SemanticModelInfo,
@@ -36,7 +38,7 @@ from pbix_doc.pipeline import Options, generate_documentation, resolve_fields
 from pbix_doc.ooxml import UnsafeDocxError, validate_docx
 from pbix_doc.projector import HeadingBlock, SafeDocumentModel, TableBlock, project_document, sanitize_dax
 from pbix_doc.renderer import atomic_write, render_document
-from pbix_doc.report import aggregation_name, parse_report
+from pbix_doc.report import aggregation_name, extract_saved_values, extract_title, parse_report
 from pbix_doc.runtime import (
     WORKSPACE_MARKER,
     WORKSPACE_PREFIX,
@@ -53,6 +55,7 @@ from pbix_doc.semantic import (
     read_model_metadata,
     safe_error_message,
     normalize_summarize_by,
+    normalize_model_data_type,
 )
 
 
@@ -266,7 +269,35 @@ class ReportParserTests(unittest.TestCase):
         self.assertEqual(len(report.navigation), 2)
         self.assertTrue(all(edge.status == "RESOLVED" for edge in report.navigation))
         self.assertEqual(report.bookmarks[0].trigger_refs, ["Детали / Вернуть обзор"])
+        self.assertEqual(report.report_filters[0].saved_values, ["Секретный регион"])
+        self.assertEqual(report.pages[1].filters[0].saved_values, ["Другой секрет"])
         self.assertFalse(issues)
+
+    def test_title_parser_does_not_use_boolean_show_flag_as_title(self) -> None:
+        show_only = {
+            "title": [{"properties": {"show": {"expr": {"Literal": {"Value": "true"}}}}}]
+        }
+        with_text = {
+            "title": [
+                {
+                    "properties": {
+                        "show": {"expr": {"Literal": {"Value": "true"}}},
+                        "text": {"expr": {"Literal": {"Value": "'Продажи'"}}},
+                    }
+                }
+            ]
+        }
+        self.assertEqual(extract_title(show_only, "visual_1"), "visual_1")
+        self.assertEqual(extract_title(with_text, "visual_1"), "Продажи")
+
+    def test_saved_filter_values_are_deduplicated_and_bounded(self) -> None:
+        literals = [
+            {"Literal": {"Value": f"'{index}'"}}
+            for index in list(range(25)) + [0, 1, 2]
+        ]
+        values, count = extract_saved_values(literals)
+        self.assertEqual(values, [str(index) for index in range(20)])
+        self.assertEqual(count, 25)
 
     def test_aggregation_codes_are_rendered_as_names(self) -> None:
         expected = {
@@ -321,6 +352,20 @@ class RendererTests(unittest.TestCase):
             issues = []
             with PbixContainer(path) as container:
                 report = parse_report(container, path.stem, issues)
+            details_revenue = next(
+                item for item in report.pages[1].visuals if item.id == "details_revenue"
+            )
+            details_revenue.fields.append(
+                FieldRef(
+                    "Sales",
+                    "Amount",
+                    "COLUMN",
+                    "Y",
+                    "VISUAL_DATA",
+                    "COUNT",
+                    "synthetic-regression",
+                )
+            )
             semantic = SemanticModelInfo(
                 "EMBEDDED",
                 tables=[
@@ -340,7 +385,7 @@ class RendererTests(unittest.TestCase):
                                 format_string="Text",
                                 source_column="region_code",
                                 native_data_type="SQL: varchar(20); M: type text",
-                                summarize_by="БЕЗ АГРЕГАЦИИ",
+                                summarize_by="Без агрегации",
                             ),
                             ColumnInfo(
                                 "Sales",
@@ -349,6 +394,7 @@ class RendererTests(unittest.TestCase):
                                 False,
                                 1000,
                                 example_status="NUMERIC_VALUES_HIDDEN",
+                                summarize_by="По умолчанию",
                             ),
                             ColumnInfo(
                                 "Sales",
@@ -373,6 +419,12 @@ class RendererTests(unittest.TestCase):
                         True,
                         "Import",
                         [ColumnInfo("LocalDateTable_123", "Date", "DateTime", True, 365)],
+                    ),
+                    TableInfo(
+                        "DateTableTemplate_456",
+                        True,
+                        "Import",
+                        [ColumnInfo("DateTableTemplate_456", "Month", "String", True, 12)],
                     ),
                 ],
                 measures=[
@@ -404,17 +456,35 @@ class RendererTests(unittest.TestCase):
         self.assertIn("РАЗЛИЧИЕ ОПРЕДЕЛЕНИЙ", text)
         self.assertIn("Каталог KPI и вычислений", text)
         self.assertIn("Реестр полей отчёта", text)
+        self.assertIn("Состав листа", text)
         self.assertIn("Варианты названий", text)
         self.assertIn("Наименование в источнике", text)
         self.assertIn("Sales[Region]", text)
         self.assertIn("region_code", text)
         self.assertIn("SQL: varchar(20); M: type text", text)
         self.assertIn("Sales[Selected region]", text)
-        self.assertIn("SUM —", text)
-        self.assertIn("<VALUES HIDDEN>", text)
-        self.assertNotIn("Секретный регион", text)
-        self.assertNotIn("Другой секрет", text)
+        self.assertIn("Секретный регион", text)
+        self.assertIn("Другой секрет", text)
         self.assertNotIn("Никогда не печатать", text)
+        self.assertNotIn("<VALUES HIDDEN>", text)
+        self.assertNotIn("NOT_AVAILABLE", text)
+        self.assertNotIn("<IDENTIFIER_OR_HIDDEN>", text)
+        self.assertNotIn("LocalDateTable_", text)
+        self.assertNotIn("DateTableTemplate_", text)
+        self.assertNotIn("RLS и OLS — формальная заглушка", text)
+        self.assertNotIn("Статус анализа: PROVISIONAL", text)
+        self.assertNotIn("Диагностика извлечения", text)
+        self.assertNotIn("PBIXRAY_NOT_INSTALLED", text)
+        self.assertNotIn("Технические идентификаторы документа", text)
+        self.assertNotIn("ИТОГОВЫЙ СТАТУС", text)
+        self.assertNotIn("Неразрешённые ссылки", text)
+        self.assertNotIn("Неразрешённых ссылок не найдено", text)
+        self.assertNotIn("Зависимости показаны символически", text)
+        self.assertNotIn("P01 ·", text)
+        self.assertNotIn("V001 ·", text)
+        self.assertNotIn("B01 ·", text)
+        self.assertNotIn("K001 ·", text)
+        self.assertIn("Ось Y / значение", text)
         self.assertNotIn(str(path.resolve()), text)
         self.assertIn("Источник", text)
         self.assertIn('Sales[Region] = "<VALUE>"', text)
@@ -424,9 +494,16 @@ class RendererTests(unittest.TestCase):
         table_headers = [tuple(cell.text for cell in table.rows[0].cells) for table in document.tables]
         filter_index = next(index for index, row in enumerate(table_headers) if row[0] == "Область")
         registry_index = next(index for index, row in enumerate(table_headers) if row[0] == "Таблица[Поле]")
+        composition_index = next(
+            index
+            for index, row in enumerate(table_headers)
+            if row[:2] == ("Лист", "Элемент")
+        )
         registry = document.tables[registry_index]
+        composition = document.tables[composition_index]
         registry_rows = {row.cells[0].text: row for row in registry.rows[1:]}
         self.assertEqual(registry_index, filter_index + 1)
+        self.assertEqual(composition_index, registry_index + 1)
         self.assertEqual(len(registry.columns), 11)
         self.assertEqual(
             table_headers[registry_index],
@@ -444,22 +521,49 @@ class RendererTests(unittest.TestCase):
                 "Варианты агрегаций",
             ),
         )
+        self.assertEqual(
+            table_headers[composition_index],
+            (
+                "Лист",
+                "Элемент",
+                "Название",
+                "Тип и назначение",
+                "Поля и показатели",
+                "Расчёт / DAX",
+                "Контекст и фильтры",
+                "Связанные закладки",
+                "Действие / переход",
+            ),
+        )
+        composition_rows = {row.cells[1].text: row for row in composition.rows[1:]}
+        self.assertTrue(all(re.fullmatch(r"[VB]\d{2,3}", key) for key in composition_rows))
+        self.assertIn("Обзор (P01)", {row.cells[0].text for row in composition.rows[1:]})
+        self.assertEqual(composition_rows["B01"].cells[2].text, "Исходный вид")
+        self.assertIn("Исходный вид (B01)", composition_rows["V001"].cells[7].text)
+        self.assertIn("Детали (P02)", composition_rows["V003"].cells[8].text)
+        self.assertIn("Sales[Selected region]", composition_rows["V002"].cells[5].text)
+        self.assertIn("CALCULATE", composition_rows["V002"].cells[5].text)
+        self.assertIn('"<VALUE>"', composition_rows["V002"].cells[5].text)
+        self.assertIn("Вернуть обзор (V004)", composition_rows["B01"].cells[8].text)
         self.assertTrue(all(row.cells[3].text == "" for row in registry.rows[1:]))
         self.assertFalse(any(name.casefold().startswith("local") for name in registry_rows))
         self.assertEqual(registry_rows["Sales[Region]"].cells[2].text, "String")
         self.assertEqual(registry_rows["Sales[UnusedFlag]"].cells[4].text, "—")
         self.assertIn("Sales[UnusedFlag]", registry_rows)
         self.assertEqual(registry_rows["Sales[UnusedFlag]"].cells[9].text, "—")
-        self.assertTrue(registry_rows["Sales[UnusedFlag]"].cells[6].text.startswith("NOT_AVAILABLE:"))
-        self.assertTrue(registry_rows["Sales[UnusedFlag]"].cells[7].text.startswith("NOT_AVAILABLE:"))
-        self.assertTrue(registry_rows["Sales[Selected region]"].cells[6].text.startswith("Не применимо:"))
-        self.assertTrue(registry_rows["Sales[Selected region]"].cells[7].text.startswith("Не применимо:"))
-        self.assertTrue(registry_rows["Sales[CalculatedAmount]"].cells[6].text.startswith("Не применимо:"))
-        self.assertTrue(registry_rows["Sales[CalculatedAmount]"].cells[7].text.startswith("Не применимо:"))
+        self.assertEqual(registry_rows["Sales[UnusedFlag]"].cells[6].text, "—")
+        self.assertEqual(registry_rows["Sales[UnusedFlag]"].cells[7].text, "—")
+        self.assertEqual(registry_rows["Sales[Selected region]"].cells[6].text, "—")
+        self.assertEqual(registry_rows["Sales[Selected region]"].cells[7].text, "—")
+        self.assertEqual(registry_rows["Sales[CalculatedAmount]"].cells[6].text, "—")
+        self.assertEqual(registry_rows["Sales[CalculatedAmount]"].cells[7].text, "—")
         self.assertNotEqual(registry_rows["Sales[CalculatedAmount]"].cells[4].text, "—")
         self.assertIn("Sales[Selected region]", registry_rows["Sales[Region]"].cells[8].text)
-        self.assertIn("SUM —", registry_rows["Sales[Amount]"].cells[10].text)
-        self.assertTrue(any(section.orientation == WD_ORIENT.LANDSCAPE for section in document.sections))
+        self.assertEqual(
+            registry_rows["Sales[Amount]"].cells[10].text,
+            "По умолчанию, SUM, COUNT",
+        )
+        self.assertTrue(all(section.orientation == WD_ORIENT.LANDSCAPE for section in document.sections))
         with zipfile.ZipFile(BytesIO(payload)) as archive:
             names = archive.namelist()
             relations = b"\n".join(
@@ -558,8 +662,8 @@ class PipelineTests(unittest.TestCase):
 
         self.assertTrue(output_exists)
         self.assertNotEqual(model.semantic_model.status, "EMBEDDED")
-        self.assertIn("ИТОГОВЫЙ СТАТУС: PARTIAL", text)
-        self.assertNotIn("Секретный регион", text)
+        self.assertNotIn("ИТОГОВЫЙ СТАТУС", text)
+        self.assertIn("Секретный регион", text)
 
     def test_workspace_is_created_beside_output_and_removed(self) -> None:
         observed: list[Path] = []
@@ -724,7 +828,7 @@ class SemanticAdapterTests(unittest.TestCase):
     def test_summarize_by_codes_are_normalized_without_bare_numbers(self) -> None:
         expected = {
             1: "По умолчанию",
-            2: "БЕЗ АГРЕГАЦИИ",
+            2: "Без агрегации",
             3: "SUM",
             4: "MIN",
             5: "MAX",
@@ -737,11 +841,28 @@ class SemanticAdapterTests(unittest.TestCase):
                 self.assertEqual(normalize_summarize_by(code), name)
                 self.assertEqual(normalize_summarize_by(str(code)), name)
         self.assertEqual(normalize_summarize_by(3.0), "SUM")
-        self.assertEqual(normalize_summarize_by("DoNotSummarize"), "БЕЗ АГРЕГАЦИИ")
+        self.assertEqual(normalize_summarize_by("DoNotSummarize"), "Без агрегации")
         self.assertEqual(normalize_summarize_by(99), "НЕИЗВЕСТНЫЙ КОД (99)")
         self.assertIsNone(normalize_summarize_by(""))
         self.assertIsNone(normalize_summarize_by(math.nan))
         self.assertIsNone(normalize_summarize_by(math.inf))
+
+    def test_model_data_type_codes_are_rendered_as_names(self) -> None:
+        expected = {
+            2: "String",
+            6: "Int64",
+            8: "Double",
+            9: "DateTime",
+            10: "Decimal",
+            11: "Boolean",
+            17: "Binary",
+            20: "Variant",
+        }
+        for code, name in expected.items():
+            with self.subTest(code=code):
+                self.assertEqual(normalize_model_data_type(code), name)
+                self.assertEqual(normalize_model_data_type(str(code)), name)
+        self.assertIsNone(normalize_model_data_type(99))
 
     def test_native_query_names_and_types_are_normalized_without_retaining_query(self) -> None:
         class FakeModel:

@@ -171,7 +171,7 @@ def resolve_fields(pages: list, semantic: SemanticModelInfo, issues: list[Issue]
                 else:
                     unresolved += 1
                     if semantic.status != "EMBEDDED":
-                        field.reason = f"Локальная модель недоступна: {semantic.status}"
+                        field.reason = "Локальная модель недоступна"
                     elif not field.reason:
                         field.reason = "Объект не найден в извлечённой семантической модели"
 

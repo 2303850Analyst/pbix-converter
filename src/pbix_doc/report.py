@@ -46,6 +46,8 @@ AGGREGATIONS = {
     8: "VARIANCE",
 }
 
+MAX_SAVED_FILTER_VALUES = 20
+
 AGGREGATION_NAMES = {
     "sum": "SUM",
     "average": "AVERAGE",
@@ -357,19 +359,6 @@ def extract_projection_fields(node: Any, visual_type: str, source_path: str) -> 
     return deduplicate_fields(fields)
 
 
-def count_literals(node: Any) -> int:
-    count = 0
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if key.casefold() == "literal":
-                count += 1
-            else:
-                count += count_literals(value)
-    elif isinstance(node, list):
-        count += sum(count_literals(value) for value in node)
-    return count
-
-
 def extract_filters(node: Any, scope: str, source_path: str) -> list[FilterInfo]:
     candidates: list[Any] = []
     for item in walk(node):
@@ -393,13 +382,46 @@ def extract_filters(node: Any, scope: str, source_path: str) -> list[FilterInfo]
         if key in seen:
             continue
         seen.add(key)
-        result.append(FilterInfo(scope, field_name, filter_type, count_literals(candidate), source_path))
+        saved_values, saved_value_count = extract_saved_values(candidate)
+        result.append(
+            FilterInfo(
+                scope,
+                field_name,
+                filter_type,
+                saved_value_count,
+                source_path,
+                saved_values,
+            )
+        )
     return result
+
+
+def extract_saved_values(node: Any) -> tuple[list[str], int]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in walk(node):
+        if not isinstance(item, dict):
+            continue
+        literal = item.get("Literal") or item.get("literal")
+        if not isinstance(literal, dict):
+            continue
+        raw = literal.get("Value") if "Value" in literal else literal.get("value")
+        value = clean_literal(raw)
+        if value is None or value in seen:
+            continue
+        seen.add(value)
+        if len(values) < MAX_SAVED_FILTER_VALUES:
+            values.append(value)
+    return values, len(seen)
 
 
 def extract_title(node: Any, fallback: str) -> str:
     direct = node.get("title") or node.get("displayName") if isinstance(node, dict) else None
-    if isinstance(direct, str) and direct.strip():
+    if (
+        isinstance(direct, str)
+        and direct.strip()
+        and direct.strip().casefold() not in {"true", "false"}
+    ):
         return direct.strip()
     for item in walk(node):
         if not isinstance(item, dict):
@@ -407,8 +429,8 @@ def extract_title(node: Any, fallback: str) -> str:
         for key, value in item.items():
             if key.casefold() != "title":
                 continue
-            text = named_scalar(value, ("text", "value", "title"))
-            if text:
+            text = named_scalar(value, ("text", "title", "displayName"))
+            if text and text.casefold() not in {"true", "false"}:
                 return text
     return fallback
 
@@ -630,8 +652,20 @@ def parse_pbir_bookmarks(
             affected = affected_visuals(exploration)
             order, group = order_group.get(bookmark_id, (fallback_order, None))
             scope = named_scalar(data, ("stateScope", "options", "applyTo")) or "CAPTURED_STATE"
+            saved_values, saved_value_count = extract_saved_values(exploration)
             result.append(
-                BookmarkInfo(bookmark_id, display_name, group, order, page_id, scope, affected, source_path=path)
+                BookmarkInfo(
+                    bookmark_id,
+                    display_name,
+                    group,
+                    order,
+                    page_id,
+                    scope,
+                    affected,
+                    source_path=path,
+                    saved_values=saved_values,
+                    saved_value_count=saved_value_count,
+                )
             )
         except Exception as error:
             issues.append(Issue("WARNING", "BOOKMARK", "BOOKMARK_PARSE_FAILED", str(error), path))
@@ -769,6 +803,7 @@ def parse_legacy_bookmarks(
             exploration = data.get("explorationState") or data
             page_value = named_scalar(exploration, ("activeSection", "section", "page"))
             page_id = page_ids.get(page_value.casefold(), page_value) if page_value else None
+            saved_values, saved_value_count = extract_saved_values(exploration)
             result.append(
                 BookmarkInfo(
                     bookmark_id,
@@ -779,6 +814,8 @@ def parse_legacy_bookmarks(
                     "CAPTURED_STATE",
                     affected_visuals(exploration),
                     source_path=source_path,
+                    saved_values=saved_values,
+                    saved_value_count=saved_value_count,
                 )
             )
     return result

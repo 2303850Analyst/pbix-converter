@@ -91,20 +91,20 @@ def atomic_write(output_path: Path, payload: bytes) -> None:
 
 def _configure_document(document: DocumentObject) -> None:
     section = document.sections[0]
-    _configure_section(section, "portrait")
-    section.header_distance = Inches(0.492)
-    section.footer_distance = Inches(0.492)
+    _configure_section(section, "landscape")
+    section.header_distance = Inches(0.3)
+    section.footer_distance = Inches(0.3)
 
     normal = document.styles["Normal"]
-    _set_style_font(normal, "Arial", 11, "000000")
+    _set_style_font(normal, "Arial", 10, "000000")
     normal.paragraph_format.space_before = Pt(0)
-    normal.paragraph_format.space_after = Pt(6)
-    normal.paragraph_format.line_spacing = 1.25
+    normal.paragraph_format.space_after = Pt(2)
+    normal.paragraph_format.line_spacing = 1.05
 
     settings = {
-        "Heading 1": (16, BLUE, 18, 10),
-        "Heading 2": (13, BLUE, 14, 7),
-        "Heading 3": (12, DARK_BLUE, 10, 5),
+        "Heading 1": (14, BLUE, 9, 4),
+        "Heading 2": (12, BLUE, 7, 3),
+        "Heading 3": (11, DARK_BLUE, 5, 2),
     }
     for name, (size, color, before, after) in settings.items():
         style = document.styles[name]
@@ -115,11 +115,11 @@ def _configure_document(document: DocumentObject) -> None:
 
     for name in ("List Bullet", "List Number"):
         style = document.styles[name]
-        _set_style_font(style, "Arial", 11, "000000")
-        style.paragraph_format.left_indent = Inches(0.375)
-        style.paragraph_format.first_line_indent = Inches(-0.188)
-        style.paragraph_format.space_after = Pt(4)
-        style.paragraph_format.line_spacing = 1.25
+        _set_style_font(style, "Arial", 10, "000000")
+        style.paragraph_format.left_indent = Inches(0.3)
+        style.paragraph_format.first_line_indent = Inches(-0.15)
+        style.paragraph_format.space_after = Pt(1)
+        style.paragraph_format.line_spacing = 1.05
 
     document.core_properties.title = "Документация Power BI"
     document.core_properties.subject = "Локальная документация PBIX для Confluence"
@@ -133,25 +133,25 @@ def _add_cover(document: DocumentObject, model: SafeDocumentModel) -> None:
     document.core_properties.created = generated
     document.core_properties.modified = generated
     spacer = document.add_paragraph()
-    spacer.paragraph_format.space_after = Pt(44)
+    spacer.paragraph_format.space_after = Pt(12)
 
     kicker = document.add_paragraph()
     kicker.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    kicker.paragraph_format.space_after = Pt(14)
+    kicker.paragraph_format.space_after = Pt(5)
     run = kicker.add_run("POWER BI · ТЕХНИЧЕСКОЕ РУКОВОДСТВО")
-    _set_run_font(run, "Arial", 10, BLUE, bold=True)
+    _set_run_font(run, "Arial", 9, BLUE, bold=True)
 
     title = document.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title.paragraph_format.space_after = Pt(8)
     run = title.add_run(clean_text(model.title))
-    _set_run_font(run, "Arial", 26, DARK_BLUE, bold=True)
+    _set_run_font(run, "Arial", 22, DARK_BLUE, bold=True)
 
     subtitle = document.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    subtitle.paragraph_format.space_after = Pt(28)
+    subtitle.paragraph_format.space_after = Pt(10)
     run = subtitle.add_run(clean_text(model.subtitle))
-    _set_run_font(run, "Arial", 13, MUTED)
+    _set_run_font(run, "Arial", 11, MUTED)
 
     cover_table = TableBlock(
         ("Параметр", "Значение"),
@@ -167,9 +167,9 @@ def _add_cover(document: DocumentObject, model: SafeDocumentModel) -> None:
     _add_table(document, cover_table)
     note = document.add_paragraph()
     note.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    note.paragraph_format.space_before = Pt(18)
-    run = note.add_run("Детальные строки данных и сохранённые значения фильтров в документ не включаются.")
-    _set_run_font(run, "Arial", 9.5, MUTED, italic=True)
+    note.paragraph_format.space_before = Pt(6)
+    run = note.add_run("Детальные строки данных не включаются; сохранённые значения фильтров берутся только из метаданных отчёта.")
+    _set_run_font(run, "Arial", 8.5, MUTED, italic=True)
 
     document.add_section(WD_SECTION.NEW_PAGE)
 
@@ -204,9 +204,9 @@ def _add_section_break(document: DocumentObject, block: SectionBreakBlock) -> No
 def _configure_section(section: object, orientation: str) -> None:
     if orientation == "landscape":
         section.orientation = WD_ORIENT.LANDSCAPE
-        section.page_width = Inches(11)
-        section.page_height = Inches(8.5)
-        margin = Inches(0.5)
+        section.page_width = Inches(11.69)
+        section.page_height = Inches(8.27)
+        margin = Inches(0.4)
     elif orientation == "portrait":
         section.orientation = WD_ORIENT.PORTRAIT
         section.page_width = Inches(8.5)
@@ -222,16 +222,16 @@ def _configure_section(section: object, orientation: str) -> None:
 
 def _add_paragraph(document: DocumentObject, block: ParagraphBlock) -> None:
     paragraph = document.add_paragraph()
-    paragraph.paragraph_format.space_after = Pt(7)
+    paragraph.paragraph_format.space_after = Pt(3)
     if block.kind in {"lead", "note", "warning", "status"}:
         _shade_paragraph(paragraph, LIGHT_GRAY if block.kind in {"lead", "note"} else "FFF4CE")
         paragraph.paragraph_format.left_indent = Inches(0.12)
         paragraph.paragraph_format.right_indent = Inches(0.12)
-        paragraph.paragraph_format.space_before = Pt(3)
-        paragraph.paragraph_format.space_after = Pt(8)
+        paragraph.paragraph_format.space_before = Pt(1)
+        paragraph.paragraph_format.space_after = Pt(3)
     run = paragraph.add_run(clean_text(block.text, preserve_newlines=True, limit=12_000))
     color = RED if block.kind == "warning" else GOLD if block.kind == "status" else "000000"
-    _set_run_font(run, "Arial", 10.5 if block.kind != "normal" else 11, color, bold=block.kind == "status")
+    _set_run_font(run, "Arial", 9.5 if block.kind != "normal" else 10, color, bold=block.kind == "status")
 
 
 def _add_list(document: DocumentObject, block: ListBlock) -> None:
@@ -239,26 +239,30 @@ def _add_list(document: DocumentObject, block: ListBlock) -> None:
     for item in block.items:
         paragraph = document.add_paragraph(style=style)
         run = paragraph.add_run(clean_text(item, limit=2_000))
-        _set_run_font(run, "Arial", 11, "000000")
+        _set_run_font(run, "Arial", 10, "000000")
 
 
 def _add_table(document: DocumentObject, block: TableBlock) -> None:
     if not block.headers or len(block.headers) > 12:
         raise ValueError("DOCX-таблица должна содержать от одной до двенадцати колонок")
-    total_width = sum(block.widths_dxa)
+    widths = block.widths_dxa
+    total_width = sum(widths)
     if len(block.headers) != len(block.widths_dxa) or total_width not in {
         CONTENT_WIDTH_DXA,
         LANDSCAPE_CONTENT_WIDTH_DXA,
     }:
         raise ValueError("Некорректная геометрия DOCX-таблицы")
+    if document.sections[-1].orientation == WD_ORIENT.LANDSCAPE and total_width == CONTENT_WIDTH_DXA:
+        widths = _scale_widths(widths, LANDSCAPE_CONTENT_WIDTH_DXA)
+        total_width = LANDSCAPE_CONTENT_WIDTH_DXA
     table = document.add_table(rows=1, cols=len(block.headers))
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.LEFT
     table.autofit = False
     header = table.rows[0]
     _repeat_header(header)
-    font_size = block.font_size or (7.2 if len(block.headers) > 5 else 9.2)
-    padding = 55 if len(block.headers) > 5 else 80
+    font_size = block.font_size or (7.2 if len(block.headers) > 5 else 8.5)
+    padding = 35 if len(block.headers) > 5 else 50
     for index, value in enumerate(block.headers):
         _set_cell_text(
             header.cells[index],
@@ -275,12 +279,12 @@ def _add_table(document: DocumentObject, block: TableBlock) -> None:
         row = table.add_row()
         for index, value in enumerate(values):
             _set_cell_text(row.cells[index], value, font_size=font_size, padding=padding)
-    _set_table_geometry(table, block.widths_dxa, total_width)
+    _set_table_geometry(table, widths, total_width)
     if not block.allow_row_split:
         for row in table.rows:
             _prevent_row_split(row)
     after = document.add_paragraph()
-    after.paragraph_format.space_after = Pt(2)
+    after.paragraph_format.space_after = Pt(0)
 
 
 def _add_code(document: DocumentObject, block: CodeBlock) -> None:
@@ -288,14 +292,14 @@ def _add_code(document: DocumentObject, block: CodeBlock) -> None:
     paragraph.paragraph_format.left_indent = Inches(0.12)
     paragraph.paragraph_format.right_indent = Inches(0.12)
     paragraph.paragraph_format.space_before = Pt(2)
-    paragraph.paragraph_format.space_after = Pt(8)
+    paragraph.paragraph_format.space_after = Pt(3)
     paragraph.paragraph_format.line_spacing = 1.0
     _shade_paragraph(paragraph, LIGHT_GRAY)
     run = paragraph.add_run(clean_text(block.text, preserve_newlines=True, limit=12_000))
-    _set_run_font(run, "Consolas", 9, "202124")
+    _set_run_font(run, "Consolas", 8.5, "202124")
     if block.status != "OK":
         status = paragraph.add_run(f"\n[{clean_text(block.status)}]")
-        _set_run_font(status, "Arial", 9, GOLD, bold=True)
+        _set_run_font(status, "Arial", 8.5, GOLD, bold=True)
 
 
 def _set_cell_text(
@@ -313,7 +317,7 @@ def _set_cell_text(
     paragraph = cell.paragraphs[0]
     paragraph.paragraph_format.space_before = Pt(0)
     paragraph.paragraph_format.space_after = Pt(0)
-    paragraph.paragraph_format.line_spacing = 1.05
+    paragraph.paragraph_format.line_spacing = 1.0
     paragraph.paragraph_format.keep_with_next = bold
     run = paragraph.add_run(clean_text(value, preserve_newlines=True, limit=None))
     _set_run_font(run, "Arial", font_size, color, bold=bold)
@@ -356,6 +360,13 @@ def _set_table_geometry(table: object, widths: tuple[int, ...], total_width: int
             tc_width = cell._tc.get_or_add_tcPr().get_or_add_tcW()
             tc_width.set(qn("w:w"), str(widths[index]))
             tc_width.set(qn("w:type"), "dxa")
+
+
+def _scale_widths(widths: tuple[int, ...], total: int) -> tuple[int, ...]:
+    source_total = sum(widths)
+    scaled = [round(value * total / source_total) for value in widths]
+    scaled[-1] += total - sum(scaled)
+    return tuple(scaled)
 
 
 def _set_cell_margins(cell: object, **values: int) -> None:

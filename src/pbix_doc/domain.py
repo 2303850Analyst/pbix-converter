@@ -48,6 +48,7 @@ class FilterInfo:
     filter_type: str
     saved_value_count: int
     source_path: str
+    saved_values: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -100,6 +101,8 @@ class BookmarkInfo:
     affected_visual_ids: list[str]
     trigger_refs: list[str] = field(default_factory=list)
     source_path: str = ""
+    saved_values: list[str] = field(default_factory=list)
+    saved_value_count: int = 0
 
 
 @dataclass(slots=True)

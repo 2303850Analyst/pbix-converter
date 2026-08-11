@@ -42,7 +42,7 @@ SENSITIVE_NAME_PARTS = (
 
 SUMMARIZE_BY_CODES = {
     1: "По умолчанию",
-    2: "БЕЗ АГРЕГАЦИИ",
+    2: "Без агрегации",
     3: "SUM",
     4: "MIN",
     5: "MAX",
@@ -53,8 +53,8 @@ SUMMARIZE_BY_CODES = {
 
 SUMMARIZE_BY_NAMES = {
     "default": "По умолчанию",
-    "none": "БЕЗ АГРЕГАЦИИ",
-    "donotsummarize": "БЕЗ АГРЕГАЦИИ",
+    "none": "Без агрегации",
+    "donotsummarize": "Без агрегации",
     "sum": "SUM",
     "min": "MIN",
     "max": "MAX",
@@ -62,6 +62,19 @@ SUMMARIZE_BY_NAMES = {
     "average": "AVERAGE",
     "avg": "AVERAGE",
     "distinctcount": "DISTINCT_COUNT",
+}
+
+MODEL_DATA_TYPE_CODES = {
+    1: "Automatic",
+    2: "String",
+    6: "Int64",
+    8: "Double",
+    9: "DateTime",
+    10: "Decimal",
+    11: "Boolean",
+    17: "Binary",
+    19: "Unknown",
+    20: "Variant",
 }
 
 
@@ -287,7 +300,7 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
                 text_or_none(rget(row, "FormatString", "Format")),
                 text_or_none(rget(row, "DisplayFolder")),
                 text_or_none(rget(row, "Description")),
-                text_or_none(rget(row, "DataType", "Type")),
+                normalize_model_data_type(rget(row, "DataType", "Type")),
             )
         )
 
@@ -363,14 +376,34 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
 
 def model_data_type(row: dict[str, Any], schema: dict[str, Any]) -> str | None:
     raw = rget(row, "DataType", "Type")
-    if raw is not None and not isinstance(raw, (int, float)):
-        text = text_or_none(raw)
-        if text and not text.isdigit():
-            return text
-    return text_or_none(
+    normalized = normalize_model_data_type(raw)
+    if normalized:
+        return normalized
+    return normalize_model_data_type(
         rget(schema, "SemanticType", "DataType", "PandasDataType")
-        or raw
     )
+
+
+def normalize_model_data_type(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    normalized: Any = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if re.fullmatch(r"[+-]?\d+", text):
+            normalized = int(text)
+        else:
+            return text
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value.is_integer():
+            normalized = int(value)
+    if isinstance(normalized, int):
+        return MODEL_DATA_TYPE_CODES.get(normalized)
+    return text_or_none(normalized)
 
 
 def native_query_column_types(rows: list[dict[str, Any]]) -> dict[tuple[str, str], str]:

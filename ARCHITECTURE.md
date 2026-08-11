@@ -71,7 +71,7 @@ CLI / Controller
     -> Atomic Writer
 ```
 
-`DocumentProjector` receives the normalized and policy-safe domain model and derives user-facing KPI lineage, same-name comparison groups, explicit context evidence, bookmark cards, navigation indexes, and document-local references. The DOCX renderer receives only `SafeDocumentModel`. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, the normalized PBIX model, or unsanitized saved values.
+`DocumentProjector` receives the normalized and policy-safe domain model and derives the field registry, unified page composition, user-facing KPI lineage, same-name comparison groups, explicit context evidence, bookmark cards, navigation indexes, and document-local references. The DOCX renderer receives only `SafeDocumentModel`. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, the normalized PBIX model, or unsanitized values.
 
 Immediately after the report-level filters, the projector emits a single field registry. It combines every locally discovered semantic column, measure, calculated column, report field reference, filter reference, visual usage, aggregation, and DAX dependency. NativeQuery is never executed or copied into the safe document model: the semantic adapter retains only normalized source-column names and data-type declarations extracted from model metadata, SQL `CAST`/`CONVERT`, or Power Query type steps.
 
@@ -129,7 +129,7 @@ The adapter may expose:
 - connection metadata;
 - model status.
 
-For every locally available column, the adapter also normalizes the Power BI data type, display format, default summarization, `SourceColumn`, and a NativeQuery/M type declaration when it can be established without executing M or SQL. Missing metadata is represented as `NOT_AVAILABLE`; the adapter must not infer a source name or type from business values.
+For every locally available column, the adapter also normalizes the Power BI data type, display format, default summarization, `SourceColumn`, and a NativeQuery/M type declaration when it can be established without executing M or SQL. Missing metadata may retain an internal `NOT_AVAILABLE` status, but the user-facing document renders it as an em dash; the adapter must not infer a source name or type from business values.
 
 Supported model statuses:
 
@@ -172,7 +172,7 @@ Default behavior:
 ```text
 Raw table rows:                  never output
 Measure results:                never calculated or output
-Saved filter/slicer literals:   hidden
+Saved filter/bookmark literals: up to twenty distinct metadata values per object
 Continuous numeric values:      hidden
 Identifiers and keys:           hidden
 Categorical examples:           maximum five
@@ -183,7 +183,7 @@ Power Query definitions:        included only after sanitization
 
 Report object counts, coordinates, model cardinality, technical versions, and other metadata are not treated as business fact values.
 
-Raw filter values and disallowed column values should be discarded before the normalized model reaches the projector. The document model contains placeholders such as `<VALUES HIDDEN>` or `<NUMERIC VALUES NOT SHOWN>`.
+Filter and bookmark literals are read only from report metadata, normalized by the report adapter, and capped before reaching the projector. They never come from table-row profiling. Disallowed column values are discarded before the normalized model reaches the projector.
 
 ## 8. Normalized domain model
 
@@ -227,6 +227,7 @@ Each normalized semantic column may additionally retain `format_string`, `source
 - short stable document-local IDs for pages, visuals, KPI definitions, bookmarks, and navigation edges;
 - symbolic KPI dependency chains without evaluating DAX;
 - usage locations and explicit report/page/visual/bookmark context evidence;
+- a unified page-composition register for visuals, controls, and bookmarks;
 - groups of identical visible titles used with different semantic objects or contexts;
 - incoming and outgoing navigation indexes and direct user journeys;
 - `PARTIAL`, `UNRESOLVED`, and overflow markers.
@@ -247,7 +248,23 @@ DAX
 Варианты агрегаций
 ```
 
-The first header is rendered as `Таблица[Поле]`. The registry includes model objects even when they are unused by a visual, except rows whose first-cell value starts with `Local` (Power BI local helper tables). The PBI type cell contains only the normalized type value, without object-kind or display-format prefixes. Visual references use the document-local page and visual IDs. DAX expressions use the normal token-aware sanitization policy, and the dependency column lists formula object names rather than evaluated results. The explanation column is intentionally empty and is never populated automatically. Missing source metadata is not a bare marker: the source-name and source-type cells explain why the value is `Не применимо` or `NOT_AVAILABLE`. Numeric aggregation enums are normalized to names such as `По умолчанию`, `SUM`, `COUNT`, or `БЕЗ АГРЕГАЦИИ`; bare enum numbers are not user-facing output.
+The first header is rendered as `Таблица[Поле]`. The registry includes model objects even when they are unused by a visual, except Power BI helper objects whose table name starts with `Local` or `DateTableTemplate_`. The PBI type cell contains only the normalized type value, without object-kind or display-format prefixes; numeric TOM type codes are mapped to their names. Cross-references use the document-local page and visual IDs together with their human-readable names. DAX expressions use the normal token-aware sanitization policy, and the dependency column lists formula object names rather than evaluated results. The explanation column is intentionally empty and is never populated automatically. Missing or inapplicable type/source cells contain an em dash. Numeric aggregation enums are normalized and deduplicated into comma-separated names such as `По умолчанию, SUM, COUNT` or `Без агрегации`; bare enum numbers are not user-facing output.
+
+Immediately after the field registry, the projector emits one `Состав листа` table with the fixed columns:
+
+```text
+Лист
+Элемент
+Название
+Тип и назначение
+Поля и показатели
+Расчёт / DAX
+Контекст и фильтры
+Связанные закладки
+Действие / переход
+```
+
+The `Элемент` cell is the sole place where a bare local ID is sufficient. All other references use `Name (ID)`. Missing visual titles are replaced with a purpose-based label; bookmark rows include the associated page, captured state, affected fields and calculations, and the controls that invoke them when those links are available in metadata.
 
 The comparison taxonomy is fixed:
 
@@ -295,22 +312,21 @@ Supported edge categories include:
 
 The processor builds a directed navigation graph and derives outgoing and incoming connections for each page. It reports missing bookmark/page targets, bookmarks with no discovered report entry point, links to hidden pages, and navigation cycles as diagnostics. A bookmark without a discovered button is not automatically invalid because it can still be used from the bookmark pane or other Power BI state.
 
-Saved slicer/filter values inside bookmarks remain hidden under `ValueExposurePolicy`.
+Saved slicer/filter values inside bookmarks may be shown from report metadata under the same twenty-value cap. Raw table rows and evaluated measure results remain prohibited.
 
-## 10. RLS and OLS output — formal placeholder until the first production run
+## 10. RLS and OLS output
 
-The RLS/OLS section is mandatory in the DOCX, but detailed corporate-security interpretation is provisional until the analyzer is tested against a real production PBIX. The first implementation must not claim complete RLS/OLS coverage.
+The RLS/OLS section is mandatory in the DOCX. It documents locally readable model definitions without a provisional or placeholder label. It does not claim current Power BI Service assignments or the effective access of a particular user.
 
-Minimum placeholder output:
+Minimum output:
 
 - whether RLS metadata was found;
 - whether OLS metadata was found;
 - role names, affected model objects, and locally readable expressions when available;
 - model availability (`EMBEDDED`, `DIRECTQUERY`, `THIN/LIVE`, or unknown);
-- explicit `PROVISIONAL` status;
 - no login, UPN, account, or role-member values.
 
-Detailed dynamic-RLS topology analysis below is a target capability, not an accepted production contract before the first real PBIX run. Its exact fields, classifications, and diagnostics will be revised from observed corporate metadata.
+Detailed dynamic-RLS topology analysis depends on the metadata available inside the selected PBIX.
 
 RLS documentation includes locally available role definitions, affected tables, DAX filter expressions, state, and metadata permission. It does not claim which real users are assigned to roles in Power BI Service.
 
@@ -360,11 +376,9 @@ OLS is separate from a login mapping table: native OLS hides tables or columns t
 
 If the PBIX does not contain the required model metadata, the section is marked `NOT_AVAILABLE` or `PARTIAL`.
 
-Until the production run, any detected pattern or propagation path is labeled `PROVISIONAL` and does not affect overall extraction success unless the underlying model reader itself fails.
+## 11. Internal unresolved-reference handling
 
-## 11. Unresolved references
-
-An unresolved reference is a field-like report reference that was discovered but could not be mapped with sufficient confidence to a semantic-model object.
+An unresolved reference is a field-like report reference that was discovered but could not be mapped with sufficient confidence to a semantic-model object. It remains available to validation and console diagnostics but is not rendered in the final DOCX.
 
 Typical causes:
 
@@ -394,7 +408,7 @@ Diagnostics describe extraction quality, not Power BI business results. They inc
 - critical read or write errors;
 - application and dependency versions.
 
-Diagnostics are printed to the console and included in the final DOCX. No permanent log file is created by default. GUI and CLI errors contain a concise message without a traceback. Evidence paths in the DOCX refer only to internal PBIX members, not to absolute Windows paths.
+Diagnostics are printed to the console but the internal extraction-diagnostics table is not included in the final DOCX. No permanent log file is created by default. GUI and CLI errors contain a concise message without a traceback. Unresolved-reference evidence paths in the DOCX refer only to internal PBIX members, not to absolute Windows paths.
 
 ## 13. DOCX output contract
 
@@ -402,18 +416,20 @@ Diagnostics are printed to the console and included in the final DOCX. No perman
 1. Report passport, extraction status, and terminology
 2. Report-level filters
 3. Complete field registry
-4. Same visible name — possible structural or context differences
-5. KPI and calculation catalog
-6. Page and visual guide
-7. Buttons, bookmarks, navigators, tooltip, and drillthrough
-8. Direct user journeys
-9. Semantic model and relationships
-10. Power Query and sources
-11. RLS and OLS
-12. Unresolved references, diagnostics, and technical appendix
+4. Unified page composition table
+5. Same visible name — possible structural or context differences
+6. KPI and calculation catalog
+7. Page and visual guide
+8. Buttons, bookmarks, navigators, tooltip, and drillthrough
+9. Direct user journeys
+10. Semantic model and relationships
+11. Power Query and sources
+12. RLS and OLS
 ```
 
-The DOCX uses the `compact_reference_guide` design preset with an Arial 11 pt body override, built-in `Heading 1`–`Heading 3`, a monospaced code style for DAX, and native Word tables. The document is portrait except for the field registry, which uses a dedicated landscape section and an 11-column compact table. All tables have explicit fixed geometry, repeated header rows, and no merged or nested cells; ordinary tables have at most five columns. Registry rows may continue across pages when their sanitized DAX is long. Color is never the sole carrier of meaning. Critical navigation does not depend on Word hyperlinks surviving Confluence import.
+The unified `Состав листа` table immediately follows the field registry. It has one row per visual, control, or bookmark and the fixed columns: page, element, name, type/purpose, fields/measures, calculation/DAX, context/filters, related bookmarks, and action/target. The `Элемент` column contains only the local ID. Every cross-reference outside that column uses the durable human-readable form `Name (ID)`; when metadata has no visible title, the projector supplies a purpose-based fallback such as `Кнопка навигации (V004)`.
+
+The DOCX uses the `compact_reference_guide` design preset with an Arial 10 pt body, built-in `Heading 1`–`Heading 3`, a monospaced code style for DAX, and native Word tables. All sections use A4 landscape orientation, narrow margins, compact paragraph spacing, and reduced cell padding. Ordinary tables expand to the available landscape width; the field registry remains an 11-column compact table and the page-composition register remains a 9-column compact table. All tables have explicit fixed geometry, repeated header rows, and no merged or nested cells; ordinary tables have at most five columns. Registry and page-composition rows may continue across pages when their sanitized DAX is long. Color is never the sole carrier of meaning. Critical navigation does not depend on Word hyperlinks surviving Confluence import.
 
 The package is macro-free OOXML. Before publication, `OOXMLValidator` rejects macros, OLE/ActiveX or embedded objects, remote templates, external relationships, external hyperlinks, automatic fields, unsafe member paths, duplicate members, invalid XML, disallowed control characters, and package or part size violations. The writer uses a same-directory temporary file, validates it, fsyncs it, and performs atomic replacement where the filesystem supports it.
 

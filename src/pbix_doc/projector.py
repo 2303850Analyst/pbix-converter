@@ -6,13 +6,23 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable
 
-from .domain import DocumentationModel, FilterInfo, MeasureInfo, PageInfo, VisualInfo
+from .domain import (
+    BookmarkInfo,
+    ColumnInfo,
+    DocumentationModel,
+    FilterInfo,
+    MeasureInfo,
+    PageInfo,
+    ReportInfo,
+    VisualInfo,
+)
 
 
 MAX_DAX_CHARS = 8_000
 MAX_DEPENDENCIES = 100
 MAX_TABLE_ROWS = 500
 MAX_FIELD_REGISTRY_ROWS = 5_000
+MAX_PAGE_COMPOSITION_ROWS = 2_000
 MAX_VISUALS = 1_000
 TABLE_WIDTH_DXA = 9_360
 LANDSCAPE_TABLE_WIDTH_DXA = 14_400
@@ -124,14 +134,12 @@ def project_document(model: DocumentationModel) -> SafeDocumentModel:
     pages = sorted(report.pages, key=lambda item: item.order)
     page_ids = {page.id: f"P{index:02d}" for index, page in enumerate(pages, 1)}
     visual_ids: dict[tuple[str, str], str] = {}
-    visual_by_raw: dict[str, list[str]] = defaultdict(list)
     visual_counter = 1
     for page in pages:
         for visual in page.visuals:
             local_id = f"V{visual_counter:03d}"
             visual_counter += 1
             visual_ids[(page.id, visual.id)] = local_id
-            visual_by_raw[visual.id].append(local_id)
     bookmark_ids = {
         bookmark.id: f"B{index:02d}"
         for index, bookmark in enumerate(sorted(report.bookmarks, key=lambda item: item.order), 1)
@@ -141,14 +149,14 @@ def project_document(model: DocumentationModel) -> SafeDocumentModel:
     blocks: list[DocumentBlock] = []
     blocks.extend(_passport(model, pages, page_ids))
     blocks.extend(_field_registry(model, pages, page_ids, visual_ids))
+    blocks.extend(_page_composition(model, pages, page_ids, visual_ids, bookmark_ids))
     blocks.extend(_difference_index(model, pages, page_ids, visual_ids, bookmark_ids))
     blocks.extend(_kpi_catalog(kpis))
     blocks.extend(_page_guide(model, pages, page_ids, visual_ids, bookmark_ids))
-    blocks.extend(_interactions(model, page_ids, visual_ids, visual_by_raw, bookmark_ids))
+    blocks.extend(_interactions(model, page_ids, visual_ids, bookmark_ids))
     blocks.extend(_journeys(model, page_ids, visual_ids, bookmark_ids))
     blocks.extend(_semantic_model(model))
     blocks.extend(_security_and_sources(model))
-    blocks.extend(_diagnostics(model, page_ids, visual_ids, bookmark_ids))
 
     return SafeDocumentModel(
         title=clean_text(report.title) or model.file.path.stem,
@@ -186,7 +194,7 @@ def _passport(
                 ("SHA-256", clean_text(model.file.sha256)),
                 ("Формат отчёта", f"{report.report_format} {report.format_version or ''}".strip()),
                 ("Версия генератора", clean_text(model.application_version)),
-                ("Версия PBIXRay", clean_text(semantic.library_version or "NOT_AVAILABLE")),
+                ("Версия PBIXRay", _display_or_dash(semantic.library_version)),
                 ("Профиль значений", "SAFE_TOP_5_CATEGORICAL"),
             ],
             (2_700, 6_660),
@@ -207,10 +215,15 @@ def _passport(
                 ),
                 (
                     "Семантическая модель",
-                    semantic.status,
-                    f"Таблиц: {len(semantic.tables)}; мер: {len(semantic.measures)}",
+                    _display_or_dash(semantic.status),
+                    f"Таблиц: {sum(not _is_internal_date_table(item.name) for item in semantic.tables)}; "
+                    f"мер: {sum(not _is_internal_date_table(item.table) for item in semantic.measures)}",
                 ),
-                ("RLS/OLS", "PROVISIONAL", "Формальная заглушка до боевого прогона"),
+                (
+                    "RLS/OLS",
+                    "Найдено" if semantic.rls or semantic.ols else "Не найдено",
+                    f"Правил RLS: {len(semantic.rls)}; правил OLS: {len(semantic.ols)}",
+                ),
             ],
             (2_600, 1_700, 5_060),
         ),
@@ -222,7 +235,7 @@ def _passport(
                 ("ВОЗМОЖНОЕ ВЛИЯНИЕ КОНТЕКСТА", "Отличаются найденные фильтры или состояние закладки."),
                 ("UNRESOLVED", "Метаданных недостаточно для надёжного вывода."),
                 ("PARTIAL", "Документ полезен, но часть структуры недоступна или не распознана."),
-                ("<VALUES HIDDEN>", "Фактические значения фильтров и срезов намеренно не выводятся."),
+                ("Значения фильтров", "Показываются сохранённые в отчёте значения; строки таблиц не выводятся."),
             ],
             (3_150, 6_210),
         ),
@@ -269,6 +282,8 @@ def _field_registry(
         return current
 
     for table in model.semantic_model.tables:
+        if _is_internal_date_table(table.name):
+            continue
         for column in table.columns:
             add_entry(
                 FieldRegistryEntry(
@@ -284,6 +299,8 @@ def _field_registry(
                 )
             )
     for measure in model.semantic_model.measures:
+        if _is_internal_date_table(measure.table):
+            continue
         add_entry(
             FieldRegistryEntry(
                 "MEASURE",
@@ -307,11 +324,11 @@ def _field_registry(
         return add_entry(FieldRegistryEntry(normalized_type, normalized_table, name))
 
     for page in pages:
-        page_label = f"{page_ids[page.id]} · {clean_text(page.name)}"
+        page_label = _page_ref(page, page_ids)
         for visual in page.visuals:
             visual_label = (
-                f"{visual_ids[(page.id, visual.id)]} · {clean_text(visual.title)} "
-                f"({page_ids[page.id]})"
+                f"{_visual_ref(visual, visual_ids[(page.id, visual.id)])}, "
+                f"лист {_page_ref(page, page_ids)}"
             )
             for item in visual.fields:
                 entry = resolve_entry(item.table, item.name, item.object_type)
@@ -320,10 +337,7 @@ def _field_registry(
                 entry.pages.add(page_label)
                 entry.visuals.add(visual_label)
                 if item.aggregation:
-                    entry.aggregations.add(
-                        f"{clean_text(item.aggregation)} — {page_ids[page.id]} / "
-                        f"{visual_ids[(page.id, visual.id)]}"
-                    )
+                    entry.aggregations.add(clean_text(item.aggregation))
             for item in visual.filters:
                 parsed = _qualified_parts(item.field)
                 if parsed:
@@ -358,7 +372,7 @@ def _field_registry(
 
     rows: list[tuple[str, ...]] = []
     ordered = sorted(
-        (entry for entry in entries.values() if not entry.table.casefold().startswith("local")),
+        (entry for entry in entries.values() if not _is_internal_date_table(entry.table)),
         key=lambda item: (item.table.casefold(), item.name.casefold(), item.object_type),
     )
     for entry in ordered[:MAX_FIELD_REGISTRY_ROWS]:
@@ -366,13 +380,12 @@ def _field_registry(
         dax_text = dax.text or (dax.reason if entry.dax_expression else "—")
         aggregations = set(entry.aggregations)
         if entry.summarize_by:
-            value = clean_text(entry.summarize_by)
-            aggregations.add("По умолчанию" if value == "По умолчанию" else f"По умолчанию: {value}")
+            aggregations.add(clean_text(entry.summarize_by))
         rows.append(
             (
                 f"{clean_text(entry.table)}[{clean_text(entry.name)}]",
                 _joined(entry.aliases),
-                clean_text(entry.data_type or "NOT_AVAILABLE"),
+                _display_or_dash(entry.data_type),
                 "",
                 clean_text(dax_text, preserve_newlines=True, limit=MAX_DAX_CHARS + len(OVERFLOW)),
                 _joined(entry.pages),
@@ -380,7 +393,7 @@ def _field_registry(
                 _source_type(entry),
                 _joined(entry.dax_usages),
                 _joined(entry.visuals),
-                _joined(aggregations),
+                _aggregation_text(aggregations),
             )
         )
     if len(ordered) > MAX_FIELD_REGISTRY_ROWS:
@@ -420,28 +433,301 @@ def _field_registry(
         )
     else:
         blocks.append(ParagraphBlock("Поля в доступной локальной метадате не найдены.", "warning"))
-    blocks.append(SectionBreakBlock("portrait"))
+    blocks.append(SectionBreakBlock("landscape"))
     return blocks
 
 
+def _page_composition(
+    model: DocumentationModel,
+    pages: list[PageInfo],
+    page_ids: dict[str, str],
+    visual_ids: dict[tuple[str, str], str],
+    bookmark_ids: dict[str, str],
+) -> list[DocumentBlock]:
+    page_by_id = {page.id: page for page in pages}
+    visual_by_key = {
+        (page.id, visual.id): visual
+        for page in pages
+        for visual in page.visuals
+    }
+    measure_by_key = {
+        (item.table.casefold(), item.name.casefold()): item
+        for item in model.semantic_model.measures
+        if not _is_internal_date_table(item.table)
+    }
+    column_by_key = {
+        (column.table.casefold(), column.name.casefold()): column
+        for table in model.semantic_model.tables
+        if not _is_internal_date_table(table.name)
+        for column in table.columns
+    }
+    bookmarks = sorted(model.report.bookmarks, key=lambda item: item.order)
+    rows: list[tuple[str, ...]] = []
+
+    def visual_row(page: PageInfo, visual: VisualInfo) -> tuple[str, ...]:
+        related = [
+            bookmark
+            for bookmark in bookmarks
+            if visual.id in bookmark.affected_visual_ids
+            and bookmark.associated_page_id in {None, page.id}
+        ]
+        return (
+            _page_ref(page, page_ids),
+            visual_ids[(page.id, visual.id)],
+            _visual_display_name(visual),
+            _visual_type_label(visual),
+            _visual_sources(visual),
+            _visual_calculations(visual, measure_by_key, column_by_key),
+            _composition_context(model, page, visual),
+            "; ".join(_bookmark_ref(item, bookmark_ids) for item in related) or "—",
+            _actions_text(model, page.id, visual, page_ids, bookmark_ids),
+        )
+
+    def bookmark_row(bookmark: BookmarkInfo) -> tuple[str, ...]:
+        page = page_by_id.get(bookmark.associated_page_id or "")
+        affected = _bookmark_visuals(bookmark, pages)
+        fields = "; ".join(
+            dict.fromkeys(
+                value
+                for _, visual in affected
+                for value in _visual_sources(visual).split("; ")
+                if value != "—"
+            )
+        ) or "—"
+        calculations = "; ".join(
+            dict.fromkeys(
+                value
+                for _, visual in affected
+                for value in [_visual_calculations(visual, measure_by_key, column_by_key)]
+                if value != "—"
+            )
+        ) or "—"
+        type_label = "Закладка"
+        if clean_text(bookmark.group):
+            type_label += f"; группа «{clean_text(bookmark.group)}»"
+        return (
+            _page_ref(page, page_ids) if page else "—",
+            bookmark_ids[bookmark.id],
+            _bookmark_display_name(bookmark),
+            type_label,
+            fields,
+            calculations,
+            _bookmark_state_text(bookmark),
+            "—",
+            _bookmark_actions(
+                model,
+                bookmark,
+                page_by_id,
+                visual_by_key,
+                page_ids,
+                visual_ids,
+            ),
+        )
+
+    for page in pages:
+        rows.extend(visual_row(page, visual) for visual in page.visuals)
+        rows.extend(bookmark_row(item) for item in bookmarks if item.associated_page_id == page.id)
+    rows.extend(bookmark_row(item) for item in bookmarks if item.associated_page_id not in page_by_id)
+
+    shown = rows[:MAX_PAGE_COMPOSITION_ROWS]
+    if len(rows) > MAX_PAGE_COMPOSITION_ROWS:
+        shown.append((OVERFLOW,) + ("",) * 8)
+    blocks: list[DocumentBlock] = [
+        HeadingBlock(1, "Состав листа"),
+        ParagraphBlock(
+            "Одна строка соответствует визуалу, элементу управления или закладке. "
+            "В колонке «Элемент» указан локальный ID; в остальных колонках ссылки приводятся как название и ID.",
+            "lead",
+        ),
+    ]
+    if shown:
+        blocks.append(
+            TableBlock(
+                (
+                    "Лист",
+                    "Элемент",
+                    "Название",
+                    "Тип и назначение",
+                    "Поля и показатели",
+                    "Расчёт / DAX",
+                    "Контекст и фильтры",
+                    "Связанные закладки",
+                    "Действие / переход",
+                ),
+                shown,
+                (1_250, 700, 1_300, 1_350, 1_800, 2_500, 1_800, 1_800, 1_900),
+                font_size=7.2,
+                allow_row_split=True,
+            )
+        )
+    else:
+        blocks.append(ParagraphBlock("Элементы листов и закладки не найдены."))
+    return blocks
+
+
+def _page_ref(page: PageInfo, page_ids: dict[str, str]) -> str:
+    return _named_ref(page.name, page_ids.get(page.id, "?"), "Лист без названия")
+
+
+def _visual_ref(visual: VisualInfo, local_id: str) -> str:
+    return f"{_visual_display_name(visual)} ({local_id})"
+
+
+def _bookmark_ref(bookmark: BookmarkInfo, bookmark_ids: dict[str, str]) -> str:
+    return f"{_bookmark_display_name(bookmark)} ({bookmark_ids.get(bookmark.id, '?')})"
+
+
+def _named_ref(name: object, local_id: str, fallback: str) -> str:
+    return f"{clean_text(name) or fallback} ({local_id})"
+
+
+def _visual_display_name(visual: VisualInfo) -> str:
+    title = clean_text(visual.title)
+    if title and title.casefold() != clean_text(visual.id).casefold():
+        return title
+    label = _visual_type_label(visual).split(";", 1)[0]
+    if label in {"Кнопка навигации", "Навигатор закладок", "Навигатор листов"}:
+        return label
+    return f"{label} без заголовка"
+
+
+def _bookmark_display_name(bookmark: BookmarkInfo) -> str:
+    return clean_text(bookmark.name) or "Закладка без названия"
+
+
+def _visual_type_label(visual: VisualInfo) -> str:
+    technical = clean_text(visual.technical_type)
+    folded = technical.casefold()
+    if "bookmarknavigator" in folded:
+        label = "Навигатор закладок"
+    elif "pagenavigator" in folded:
+        label = "Навигатор листов"
+    elif "button" in folded:
+        label = "Кнопка навигации" if visual.actions else "Кнопка"
+    elif "slicer" in folded:
+        label = "Срез"
+    elif "textbox" in folded or folded == "text":
+        label = "Текстовый блок"
+    elif "image" in folded:
+        label = "Изображение"
+    elif "shape" in folded:
+        label = "Фигура"
+    elif "matrix" in folded:
+        label = "Матрица"
+    elif "table" in folded:
+        label = "Таблица"
+    elif "card" in folded or "kpi" in folded or "gauge" in folded:
+        label = "Карточка KPI"
+    elif "chart" in folded or "map" in folded or "funnel" in folded:
+        label = "Диаграмма"
+    elif visual.category == "CUSTOM_VISUAL":
+        label = f"Пользовательский визуал ({technical})"
+    else:
+        label = f"Визуал ({technical})" if technical else "Визуал"
+    return f"{label}; скрыт" if not visual.visible else label
+
+
+def _visual_calculations(
+    visual: VisualInfo,
+    measure_by_key: dict[tuple[str, str], MeasureInfo],
+    column_by_key: dict[tuple[str, str], ColumnInfo],
+) -> str:
+    values: list[str] = []
+    for item in visual.fields:
+        if _is_internal_date_table(item.table):
+            continue
+        qualified = clean_text(item.qualified_name)
+        key = ((item.table or "").casefold(), item.name.casefold())
+        if item.aggregation:
+            values.append(f"{qualified}: {clean_text(item.aggregation)}")
+        measure = measure_by_key.get(key)
+        column = column_by_key.get(key)
+        expression = measure.expression if measure else column.expression if column else None
+        dax = sanitize_dax(expression)
+        if dax.text:
+            values.append(f"{qualified}: {dax.text}")
+        elif expression:
+            values.append(f"{qualified}: {dax.reason or 'формула недоступна'}")
+    return "\n".join(dict.fromkeys(values)) or "—"
+
+
+def _composition_context(
+    model: DocumentationModel,
+    page: PageInfo,
+    visual: VisualInfo,
+) -> str:
+    items = [_filter_context_text(item) for item in model.report.report_filters]
+    items.extend(_filter_context_text(item) for item in page.filters)
+    items.extend(_filter_context_text(item) for item in visual.filters)
+    return "; ".join(dict.fromkeys(clean_text(item) for item in items)) or "—"
+
+
+def _bookmark_visuals(
+    bookmark: BookmarkInfo,
+    pages: list[PageInfo],
+) -> list[tuple[PageInfo, VisualInfo]]:
+    return [
+        (page, visual)
+        for page in pages
+        if bookmark.associated_page_id in {None, page.id}
+        for visual in page.visuals
+        if visual.id in bookmark.affected_visual_ids
+    ]
+
+
+def _bookmark_actions(
+    model: DocumentationModel,
+    bookmark: BookmarkInfo,
+    page_by_id: dict[str, PageInfo],
+    visual_by_key: dict[tuple[str, str], VisualInfo],
+    page_ids: dict[str, str],
+    visual_ids: dict[tuple[str, str], str],
+) -> str:
+    values: list[str] = []
+    page = page_by_id.get(bookmark.associated_page_id or "")
+    if page:
+        values.append(f"Открывает сохранённое состояние на листе {_page_ref(page, page_ids)}")
+    for edge in model.report.navigation:
+        if edge.target_kind != "BOOKMARK" or edge.target_id != bookmark.id:
+            continue
+        key = (edge.source_page_id, edge.source_visual_id)
+        visual = visual_by_key.get(key)
+        if visual:
+            values.append(
+                f"Вызывается элементом {_visual_ref(visual, visual_ids.get(key, '?'))}"
+            )
+    return "; ".join(dict.fromkeys(values)) or "—"
+
+
+def _bookmark_trigger_text(
+    report: ReportInfo,
+    bookmark: BookmarkInfo,
+    visual_by_key: dict[tuple[str, str], VisualInfo],
+    visual_ids: dict[tuple[str, str], str],
+) -> str:
+    values: list[str] = []
+    for edge in report.navigation:
+        if edge.target_kind != "BOOKMARK" or edge.target_id != bookmark.id:
+            continue
+        key = (edge.source_page_id, edge.source_visual_id)
+        visual = visual_by_key.get(key)
+        if visual:
+            values.append(_visual_ref(visual, visual_ids.get(key, "?")))
+    if not values:
+        values.extend(clean_text(value) for value in bookmark.trigger_refs if clean_text(value))
+    return "; ".join(dict.fromkeys(values)) or "—"
+
+
 def _source_name(entry: FieldRegistryEntry) -> str:
-    if entry.object_type == "MEASURE":
-        return "Не применимо: мера вычисляется в модели и не имеет исходной колонки"
     if entry.source_column:
         return clean_text(entry.source_column)
-    if entry.dax_expression:
-        return "Не применимо: вычисляемый столбец создаётся в модели"
-    return "NOT_AVAILABLE: имя исходной колонки отсутствует в локальной метадате PBIX"
+    return "—"
 
 
 def _source_type(entry: FieldRegistryEntry) -> str:
-    if entry.object_type == "MEASURE":
-        return "Не применимо: тип результата меры задаётся моделью"
     if entry.native_data_type:
         return clean_text(entry.native_data_type)
-    if entry.dax_expression and not entry.source_column:
-        return "Не применимо: вычисляемый столбец типизируется в модели"
-    return "NOT_AVAILABLE: тип исходной колонки отсутствует в локальной метадате PBIX"
+    return "—"
 
 
 def _qualified_parts(value: str) -> tuple[str, str] | None:
@@ -480,6 +766,28 @@ def _resolve_registry_reference(
 def _joined(values: Iterable[str]) -> str:
     ordered = sorted({clean_text(value) for value in values if clean_text(value)}, key=str.casefold)
     return "; ".join(ordered) or "—"
+
+
+def _aggregation_text(values: Iterable[str]) -> str:
+    priority = {
+        "по умолчанию": 0,
+        "без агрегации": 1,
+        "sum": 2,
+        "average": 3,
+        "count": 4,
+        "distinct_count": 5,
+        "count_non_null": 6,
+        "min": 7,
+        "max": 8,
+        "median": 9,
+        "standard_deviation": 10,
+        "variance": 11,
+    }
+    ordered = sorted(
+        {clean_text(value) for value in values if clean_text(value)},
+        key=lambda value: (priority.get(value.casefold(), 99), value.casefold()),
+    )
+    return ", ".join(ordered) or "—"
 
 
 def _difference_index(
@@ -528,8 +836,8 @@ def _difference_index(
                     ("Расположение", "Визуал", "Объект модели", "Метод", "Контекст"),
                     [
                         (
-                            f"{page_ids[page.id]} · {clean_text(page.name)}",
-                            visual_ids[(page.id, visual.id)],
+                            _page_ref(page, page_ids),
+                            _visual_ref(visual, visual_ids[(page.id, visual.id)]),
                             _visual_sources(visual),
                             _visual_method(visual),
                             _context_text(model, page, visual, bookmark_ids),
@@ -551,15 +859,23 @@ def _project_kpis(
     visual_ids: dict[tuple[str, str], str],
     bookmark_ids: dict[str, str],
 ) -> list[KpiProjection]:
-    measures = {(item.table.casefold(), item.name.casefold()): item for item in model.semantic_model.measures}
+    measures = {
+        (item.table.casefold(), item.name.casefold()): item
+        for item in model.semantic_model.measures
+        if not _is_internal_date_table(item.table)
+    }
     candidates: dict[tuple[str, ...], dict[str, object]] = {}
     for measure in sorted(model.semantic_model.measures, key=lambda item: (item.table.casefold(), item.name.casefold())):
+        if _is_internal_date_table(measure.table):
+            continue
         key = ("MEASURE", measure.table.casefold(), measure.name.casefold())
         candidates[key] = {"measure": measure, "fields": []}
 
     for page in sorted(model.report.pages, key=lambda item: item.order):
         for visual in page.visuals:
             for item in visual.fields:
+                if _is_internal_date_table(item.table):
+                    continue
                 if item.object_type == "MEASURE":
                     key = ("MEASURE", (item.table or "").casefold(), item.name.casefold())
                 elif item.aggregation:
@@ -612,9 +928,9 @@ def _project_kpis(
         )
         usages = [
             (
-                f"{page_ids[page.id]} · {clean_text(page.name)}",
-                f"{visual_ids[(page.id, visual.id)]} · {clean_text(visual.title)}",
-                clean_text(item.role or "—"),
+                _page_ref(page, page_ids),
+                _visual_ref(visual, visual_ids[(page.id, visual.id)]),
+                _visual_role_label(item.role),
                 _method_label(item.aggregation, item.object_type, item.usage),
                 _context_text(model, page, visual, bookmark_ids),
             )
@@ -649,14 +965,7 @@ def _project_kpis(
 
 
 def _kpi_catalog(kpis: list[KpiProjection]) -> list[DocumentBlock]:
-    blocks: list[DocumentBlock] = [
-        HeadingBlock(1, "Каталог KPI и вычислений"),
-        ParagraphBlock(
-            "Зависимости показаны символически по формулам и привязкам визуалов. "
-            "Описание модели приводится как авторская метадата и не является выводом программы.",
-            "lead",
-        ),
-    ]
+    blocks: list[DocumentBlock] = [HeadingBlock(1, "Каталог KPI и вычислений")]
     if not kpis:
         blocks.append(ParagraphBlock("Меры и агрегированные показатели не найдены."))
         return blocks
@@ -664,7 +973,7 @@ def _kpi_catalog(kpis: list[KpiProjection]) -> list[DocumentBlock]:
         display = ", ".join(item.display_names) or item.semantic_source
         blocks.extend(
             [
-                HeadingBlock(2, f"{item.local_id} · {display}"),
+                HeadingBlock(2, _named_ref(display, item.local_id, "Вычисление без названия")),
                 TableBlock(
                     ("Параметр", "Значение"),
                     [
@@ -672,7 +981,7 @@ def _kpi_catalog(kpis: list[KpiProjection]) -> list[DocumentBlock]:
                         ("Метод", item.method),
                         ("Видимые названия", "; ".join(item.display_names) or "—"),
                         ("Зависимости", "; ".join(item.dependencies) or "Не обнаружены"),
-                        ("Описание модели", item.description or "NOT_AVAILABLE"),
+                        ("Описание модели", item.description or "—"),
                         ("Статус", item.status),
                     ],
                     (2_300, 7_060),
@@ -683,12 +992,12 @@ def _kpi_catalog(kpis: list[KpiProjection]) -> list[DocumentBlock]:
         if item.dax.text:
             blocks.append(CodeBlock(item.dax.text, item.dax.status))
         else:
-            blocks.append(ParagraphBlock(item.dax.reason or "DAX: NOT_AVAILABLE", "warning"))
+            blocks.append(ParagraphBlock(item.dax.reason or "Определение DAX недоступно.", "warning"))
         blocks.append(HeadingBlock(3, "Где используется и какой контекст обнаружен"))
         if item.usages:
             blocks.append(
                 TableBlock(
-                    ("Лист", "Визуал", "Роль", "Агрегация", "Контекст"),
+                    ("Лист", "Визуал", "Роль поля", "Агрегация", "Контекст"),
                     item.usages,
                     (1_600, 2_250, 1_150, 1_300, 3_060),
                 )
@@ -710,7 +1019,7 @@ def _page_guide(
     for page in pages:
         blocks.extend(
             [
-                HeadingBlock(2, f"{page_ids[page.id]} · {clean_text(page.name)}"),
+                HeadingBlock(2, _page_ref(page, page_ids)),
                 TableBlock(
                     ("Параметр", "Значение"),
                     [
@@ -732,11 +1041,11 @@ def _page_guide(
                     ("Визуал и тип", "Поля и метод", "Контекст", "Действия"),
                     [
                         (
-                            f"{visual_ids[(page.id, visual.id)]} · {clean_text(visual.title)}\n"
+                            f"{_visual_ref(visual, visual_ids[(page.id, visual.id)])}\n"
                             f"{clean_text(visual.category)} / {clean_text(visual.technical_type)}",
                             _visual_method(visual, include_sources=True),
                             _context_text(model, page, visual, bookmark_ids),
-                            _actions_text(model, visual, page_ids, bookmark_ids),
+                            _actions_text(model, page.id, visual, page_ids, bookmark_ids),
                         )
                         for visual in shown
                     ],
@@ -764,11 +1073,15 @@ def _interactions(
     model: DocumentationModel,
     page_ids: dict[str, str],
     visual_ids: dict[tuple[str, str], str],
-    visual_by_raw: dict[str, list[str]],
     bookmark_ids: dict[str, str],
 ) -> list[DocumentBlock]:
     report = model.report
     page_by_id = {page.id: page for page in report.pages}
+    visual_by_key = {
+        (page.id, visual.id): visual
+        for page in report.pages
+        for visual in page.visuals
+    }
     blocks: list[DocumentBlock] = [
         HeadingBlock(1, "Кнопки, закладки и переходы"),
         ParagraphBlock(
@@ -782,31 +1095,34 @@ def _interactions(
     if bookmarks:
         blocks.append(
             TableBlock(
-                ("Закладка", "Группа / лист", "Scope", "Точки входа", "Затронутые визуалы"),
+                ("Закладка", "Группа / лист", "Сохранённое состояние", "Точки входа", "Затронутые визуалы"),
                 [
                     (
-                        f"{bookmark_ids[item.id]} · {clean_text(item.name)}",
+                        _bookmark_ref(item, bookmark_ids),
                         f"{clean_text(item.group or '—')} / "
                         + (
-                            f"{page_ids[item.associated_page_id]} · {clean_text(page_by_id[item.associated_page_id].name)}"
+                            _page_ref(page_by_id[item.associated_page_id], page_ids)
                             if item.associated_page_id in page_ids
-                            else "<НЕ ОПРЕДЕЛЁН>"
+                            else "—"
                         ),
-                        _scope_label(item.state_scope),
-                        "; ".join(clean_text(value) for value in item.trigger_refs) or "<НЕ НАЙДЕНЫ>",
+                        _bookmark_state_text(item),
+                        _bookmark_trigger_text(
+                            report,
+                            item,
+                            visual_by_key,
+                            visual_ids,
+                        ),
                         "; ".join(
-                            local
-                            for raw in item.affected_visual_ids
-                            for local in visual_by_raw.get(raw, [f"<UNRESOLVED:{clean_text(raw)}>"])
+                            _visual_ref(visual, visual_ids.get((page.id, visual.id), "?"))
+                            for page, visual in _bookmark_visuals(item, report.pages)
                         )
-                        or "<НЕ ОПРЕДЕЛЕНЫ>",
+                        or "—",
                     )
                     for item in bookmarks[:MAX_TABLE_ROWS]
                 ],
                 (1_850, 2_050, 1_300, 2_100, 2_060),
             )
         )
-        blocks.append(ParagraphBlock("Сохранённые значения фильтров и срезов: <VALUES HIDDEN>.", "note"))
     else:
         blocks.append(ParagraphBlock("Закладки не найдены."))
 
@@ -817,9 +1133,16 @@ def _interactions(
                 ("Источник", "Что нажать", "Тип", "Цель", "Статус / эффект"),
                 [
                     (
-                        f"{page_ids.get(edge.source_page_id, '?')} · {clean_text(edge.source_page_name)}",
-                        f"{visual_ids.get((edge.source_page_id, edge.source_visual_id), '?')} · "
-                        f"{clean_text(edge.source_visual_title)}",
+                        _named_ref(
+                            edge.source_page_name,
+                            page_ids.get(edge.source_page_id, "?"),
+                            "Лист без названия",
+                        ),
+                        _named_ref(
+                            edge.source_visual_title,
+                            visual_ids.get((edge.source_page_id, edge.source_visual_id), "?"),
+                            "Элемент без названия",
+                        ),
                         _action_label(edge.action_type),
                         _edge_target(edge, page_ids, bookmark_ids),
                         f"{clean_text(edge.status)}; metadata указывает переход: {_target_kind_label(edge.target_kind)}",
@@ -852,9 +1175,16 @@ def _journeys(
             ("Откуда", "Через элемент", "Действие", "Куда", "Статус"),
             [
                 (
-                    f"{page_ids.get(edge.source_page_id, '?')} · {clean_text(edge.source_page_name)}",
-                    f"{visual_ids.get((edge.source_page_id, edge.source_visual_id), '?')} · "
-                    f"{clean_text(edge.source_visual_title)}",
+                    _named_ref(
+                        edge.source_page_name,
+                        page_ids.get(edge.source_page_id, "?"),
+                        "Лист без названия",
+                    ),
+                    _named_ref(
+                        edge.source_visual_title,
+                        visual_ids.get((edge.source_page_id, edge.source_visual_id), "?"),
+                        "Элемент без названия",
+                    ),
                     _action_label(edge.action_type),
                     _edge_target(edge, page_ids, bookmark_ids),
                     clean_text(edge.status),
@@ -869,14 +1199,20 @@ def _journeys(
 
 def _semantic_model(model: DocumentationModel) -> list[DocumentBlock]:
     semantic = model.semantic_model
+    tables = [item for item in semantic.tables if not _is_internal_date_table(item.name)]
+    relationships = [
+        item
+        for item in semantic.relationships
+        if not _is_internal_field(item.from_object) and not _is_internal_field(item.to_object)
+    ]
     blocks: list[DocumentBlock] = [
         HeadingBlock(1, "Семантическая модель и связи"),
-        ParagraphBlock(f"Статус локальной модели: {clean_text(semantic.status)}", "status"),
+        ParagraphBlock(f"Статус локальной модели: {_display_or_dash(semantic.status)}", "status"),
     ]
-    if not semantic.tables and not semantic.measures:
+    if not tables and not semantic.measures:
         blocks.append(ParagraphBlock("Локальная семантическая модель недоступна.", "warning"))
         return blocks
-    if semantic.tables:
+    if tables:
         blocks.extend(
             [
                 HeadingBlock(2, "Таблицы"),
@@ -889,24 +1225,25 @@ def _semantic_model(model: DocumentationModel) -> list[DocumentBlock]:
                             clean_text(item.storage_mode or "—"),
                             str(len(item.columns)),
                         )
-                        for item in semantic.tables[:MAX_TABLE_ROWS]
+                        for item in tables[:MAX_TABLE_ROWS]
                     ],
                     (3_000, 1_400, 2_600, 2_360),
                 ),
                 HeadingBlock(2, "Колонки и безопасные примеры"),
             ]
         )
-        columns = [column for table in semantic.tables for column in table.columns]
+        columns = [column for table in tables for column in table.columns]
         blocks.append(
             TableBlock(
                 ("Таблица / колонка", "Тип", "Скрыта", "Уникальных", "Примеры / статус"),
                 [
                     (
                         f"{clean_text(item.table)}[{clean_text(item.name)}]",
-                        clean_text(item.data_type or "—"),
+                        _display_or_dash(item.data_type),
                         yes_no(item.hidden),
                         str(item.cardinality) if item.cardinality is not None else "—",
-                        "; ".join(clean_text(value) for value in item.examples) or f"<{clean_text(item.example_status)}>",
+                        "; ".join(clean_text(value) for value in item.examples)
+                        or _example_status_label(item.example_status),
                     )
                     for item in columns[:MAX_TABLE_ROWS]
                 ],
@@ -915,7 +1252,7 @@ def _semantic_model(model: DocumentationModel) -> list[DocumentBlock]:
         )
         if len(columns) > MAX_TABLE_ROWS:
             blocks.append(ParagraphBlock(OVERFLOW, "warning"))
-    if semantic.relationships:
+    if relationships:
         blocks.extend(
             [
                 HeadingBlock(2, "Связи"),
@@ -929,7 +1266,7 @@ def _semantic_model(model: DocumentationModel) -> list[DocumentBlock]:
                             clean_text(item.filter_direction or "—"),
                             f"Активна: {yes_no(item.active)}; security: {clean_text(item.security_filter or '—')}",
                         )
-                        for item in semantic.relationships[:MAX_TABLE_ROWS]
+                        for item in relationships[:MAX_TABLE_ROWS]
                     ],
                     (2_250, 2_250, 1_500, 1_550, 1_810),
                 ),
@@ -942,7 +1279,8 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
     semantic = model.semantic_model
     blocks: list[DocumentBlock] = [HeadingBlock(1, "Power Query, источники и безопасность")]
     blocks.append(HeadingBlock(2, "Power Query и подключения"))
-    if semantic.queries:
+    queries = [item for item in semantic.queries if not _is_internal_date_table(item.name)]
+    if queries:
         blocks.append(
             TableBlock(
                 ("Запрос", "Тип", "Выражение"),
@@ -950,15 +1288,15 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
                     (
                         clean_text(item.name),
                         clean_text(item.kind),
-                        "DEFINED; CONTENT OMITTED IN SAFE MODE" if item.expression_available else "NOT_AVAILABLE",
+                        "Определено; текст не выводится" if item.expression_available else "—",
                     )
-                    for item in semantic.queries[:MAX_TABLE_ROWS]
+                    for item in queries[:MAX_TABLE_ROWS]
                 ],
                 (3_100, 2_200, 4_060),
             )
         )
     else:
-        blocks.append(ParagraphBlock("Power Query metadata: NOT_AVAILABLE."))
+        blocks.append(ParagraphBlock("Метаданные Power Query не найдены или недоступны."))
     blocks.append(
         ParagraphBlock(
             "Типы подключений: "
@@ -966,15 +1304,7 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
             "note",
         )
     )
-    blocks.extend(
-        [
-            HeadingBlock(2, "RLS и OLS — формальная заглушка"),
-            ParagraphBlock(
-                "Статус анализа: PROVISIONAL. Логины, UPN, пользователи и назначения ролей не выводятся.",
-                "warning",
-            ),
-        ]
-    )
+    blocks.append(HeadingBlock(2, "RLS и OLS"))
     if semantic.rls:
         rows: list[tuple[str, ...]] = []
         for rule in semantic.rls[:MAX_TABLE_ROWS]:
@@ -989,7 +1319,7 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
             )
         blocks.append(TableBlock(("Роль", "Таблица", "DAX-фильтр", "Разрешение"), rows, (2_100, 1_900, 3_760, 1_600)))
     else:
-        blocks.append(ParagraphBlock("RLS metadata: NOT_FOUND_OR_NOT_AVAILABLE."))
+        blocks.append(ParagraphBlock("Метаданные RLS не найдены или недоступны."))
     if semantic.ols:
         blocks.append(
             TableBlock(
@@ -1007,80 +1337,13 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
             )
         )
     else:
-        blocks.append(ParagraphBlock("OLS metadata: NOT_FOUND_OR_NOT_AVAILABLE."))
-    return blocks
-
-
-def _diagnostics(
-    model: DocumentationModel,
-    page_ids: dict[str, str],
-    visual_ids: dict[tuple[str, str], str],
-    bookmark_ids: dict[str, str],
-) -> list[DocumentBlock]:
-    unresolved = [
-        (page, visual, item)
-        for page in model.report.pages
-        for visual in page.visuals
-        for item in visual.fields
-        if item.status != "RESOLVED"
-    ]
-    blocks: list[DocumentBlock] = [HeadingBlock(1, "Неполные сведения и диагностика")]
-    blocks.append(HeadingBlock(2, "Неразрешённые ссылки"))
-    if unresolved:
-        blocks.append(
-            TableBlock(
-                ("Объект", "Расположение", "Причина", "Путь-источник"),
-                [
-                    (
-                        clean_text(item.qualified_name),
-                        f"{page_ids.get(page.id, '?')} / {visual_ids.get((page.id, visual.id), '?')}",
-                        clean_text(item.reason or "Не указана"),
-                        clean_text(item.source_path),
-                    )
-                    for page, visual, item in unresolved[:MAX_TABLE_ROWS]
-                ],
-                (2_200, 1_400, 2_700, 3_060),
-            )
-        )
-    else:
-        blocks.append(ParagraphBlock("Неразрешённых ссылок не найдено."))
-    blocks.append(HeadingBlock(2, "Диагностика извлечения"))
-    if model.issues:
-        blocks.append(
-            TableBlock(
-                ("Уровень", "Компонент", "Код", "Сообщение", "Источник"),
-                [
-                    (
-                        clean_text(item.severity),
-                        clean_text(item.component),
-                        clean_text(item.code),
-                        clean_text(item.message),
-                        clean_text(item.source_path or "—"),
-                    )
-                    for item in model.issues[:MAX_TABLE_ROWS]
-                ],
-                (1_050, 1_300, 1_800, 3_150, 2_060),
-            )
-        )
-    else:
-        blocks.append(ParagraphBlock("Предупреждения и ошибки отсутствуют."))
-    blocks.extend(
-        [
-            HeadingBlock(2, "Технические идентификаторы документа"),
-            ParagraphBlock(
-                "P — лист, V — визуал, K — KPI/вычисление, B — закладка. "
-                "Эти идентификаторы локальны для данной выгрузки и стабильны при одинаковом порядке metadata.",
-                "note",
-            ),
-            ParagraphBlock(f"ИТОГОВЫЙ СТАТУС: {overall_status(model)}", "status"),
-        ]
-    )
+        blocks.append(ParagraphBlock("Метаданные OLS не найдены или недоступны."))
     return blocks
 
 
 def sanitize_dax(expression: str | None) -> DaxProjection:
     if not expression:
-        return DaxProjection(None, "NOT_AVAILABLE", [], [], "DAX: NOT_AVAILABLE")
+        return DaxProjection(None, "NOT_AVAILABLE", [], [], "Определение DAX недоступно")
     text = clean_text(expression, preserve_newlines=True)
     output: list[str] = []
     index = 0
@@ -1188,7 +1451,7 @@ def _dependency_paths(
             return
         for reference in dax_by_key.get(key, DaxProjection(None, "NOT_AVAILABLE", [], [])).references:
             target = resolve(reference)
-            label = f"{local_ids[target]} {reference}" if target else reference
+            label = f"{reference} ({local_ids[target]})" if target else reference
             path = prefix + [label]
             paths.append(" → ".join(path))
             if target and target not in seen:
@@ -1206,12 +1469,15 @@ def _context_items(
     visual: VisualInfo,
     bookmark_ids: dict[str, str],
 ) -> list[str]:
-    items = [f"REPORT: {item.field} ({item.filter_type})" for item in model.report.report_filters]
-    items.extend(f"PAGE: {item.field} ({item.filter_type})" for item in page.filters)
-    items.extend(f"VISUAL: {item.field} ({item.filter_type})" for item in visual.filters)
+    items = [_filter_context_text(item) for item in model.report.report_filters]
+    items.extend(_filter_context_text(item) for item in page.filters)
+    items.extend(_filter_context_text(item) for item in visual.filters)
     for bookmark in model.report.bookmarks:
         if bookmark.associated_page_id == page.id and visual.id in bookmark.affected_visual_ids:
-            items.append(f"{bookmark_ids.get(bookmark.id, '?')}: {_scope_label(bookmark.state_scope)}")
+            items.append(
+                f"Закладка {_bookmark_ref(bookmark, bookmark_ids)}: "
+                f"{_bookmark_state_text(bookmark)}"
+            )
     return [clean_text(item) for item in items]
 
 
@@ -1222,7 +1488,7 @@ def _context_text(
     bookmark_ids: dict[str, str],
 ) -> str:
     items = _context_items(model, page, visual, bookmark_ids)
-    return "; ".join(items) + "; значения: <VALUES HIDDEN>" if items else "Явные фильтры/закладки не обнаружены"
+    return "; ".join(items) if items else "Явные фильтры и закладки не обнаружены"
 
 
 def _context_signature(
@@ -1249,12 +1515,20 @@ def _semantic_signature(visual: VisualInfo) -> tuple[tuple[str, str, str, str], 
 
 
 def _visual_sources(visual: VisualInfo) -> str:
-    return "; ".join(dict.fromkeys(clean_text(item.qualified_name) for item in visual.fields)) or "—"
+    return "; ".join(
+        dict.fromkeys(
+            clean_text(item.qualified_name)
+            for item in visual.fields
+            if not _is_internal_date_table(item.table)
+        )
+    ) or "—"
 
 
 def _visual_method(visual: VisualInfo, *, include_sources: bool = False) -> str:
     values = []
     for item in visual.fields:
+        if _is_internal_date_table(item.table):
+            continue
         method = _method_label(item.aggregation, item.object_type, item.usage)
         value = f"{item.qualified_name}: {method}" if include_sources else method
         values.append(clean_text(value))
@@ -1263,11 +1537,16 @@ def _visual_method(visual: VisualInfo, *, include_sources: bool = False) -> str:
 
 def _actions_text(
     model: DocumentationModel,
+    page_id: str,
     visual: VisualInfo,
     page_ids: dict[str, str],
     bookmark_ids: dict[str, str],
 ) -> str:
-    edges = [edge for edge in model.report.navigation if edge.source_visual_id == visual.id]
+    edges = [
+        edge
+        for edge in model.report.navigation
+        if edge.source_page_id == page_id and edge.source_visual_id == visual.id
+    ]
     return "; ".join(
         f"{_action_label(edge.action_type)} → {_edge_target(edge, page_ids, bookmark_ids)}" for edge in edges
     ) or "—"
@@ -1278,12 +1557,19 @@ def _edge_target(edge: object, page_ids: dict[str, str], bookmark_ids: dict[str,
     target_id = getattr(edge, "target_id")
     target_name = clean_text(getattr(edge, "target_name") or "—")
     if target_kind == "PAGE" and getattr(edge, "target_page_id") in page_ids:
-        return f"{page_ids[getattr(edge, 'target_page_id')]} · {target_name}"
+        return _named_ref(
+            target_name,
+            page_ids[getattr(edge, "target_page_id")],
+            "Лист без названия",
+        )
     if target_kind == "BOOKMARK" and target_id in bookmark_ids:
         page = getattr(edge, "target_page_id")
-        suffix = f" → {page_ids[page]}" if page in page_ids else ""
-        return f"{bookmark_ids[target_id]} · {target_name}{suffix}"
-    return f"{clean_text(target_kind)} · {target_name}"
+        result = _named_ref(target_name, bookmark_ids[target_id], "Закладка без названия")
+        if page in page_ids:
+            page_name = clean_text(getattr(edge, "target_page_name") or "")
+            result += f", лист {_named_ref(page_name, page_ids[page], 'Лист без названия')}"
+        return result
+    return f"{_target_kind_label(clean_text(target_kind))}: {target_name}"
 
 
 def _filter_table(filters: Iterable[FilterInfo]) -> TableBlock:
@@ -1291,10 +1577,10 @@ def _filter_table(filters: Iterable[FilterInfo]) -> TableBlock:
         ("Область", "Поле", "Тип", "Значения"),
         [
             (
-                clean_text(item.scope),
+                _filter_scope_label(item.scope),
                 clean_text(item.field),
-                clean_text(item.filter_type),
-                f"<VALUES HIDDEN>; сохранено: {item.saved_value_count}",
+                _filter_type_label(item.filter_type),
+                _saved_values_text(item.saved_values, item.saved_value_count),
             )
             for item in list(filters)[:MAX_TABLE_ROWS]
         ],
@@ -1303,8 +1589,57 @@ def _filter_table(filters: Iterable[FilterInfo]) -> TableBlock:
 
 
 def _filters_text(filters: Iterable[FilterInfo]) -> str:
-    values = [f"{item.scope}: {item.field} ({item.filter_type}); <VALUES HIDDEN>" for item in filters]
+    values = [_filter_context_text(item) for item in filters]
     return "; ".join(clean_text(value) for value in values) or "Не найдены"
+
+
+def _filter_context_text(item: FilterInfo) -> str:
+    return (
+        f"{_filter_scope_label(item.scope)}: {clean_text(item.field)} "
+        f"({_filter_type_label(item.filter_type)}); "
+        f"значения: {_saved_values_text(item.saved_values, item.saved_value_count)}"
+    )
+
+
+def _saved_values_text(values: Iterable[str], count: int) -> str:
+    shown = [_literal_display(value) for value in values if clean_text(value)]
+    text = ", ".join(shown) or "—"
+    hidden_count = max(0, count - len(shown))
+    return f"{text} … ещё {hidden_count}" if hidden_count else text
+
+
+def _literal_display(value: str) -> str:
+    text = clean_text(value)
+    return {"true": "Да", "false": "Нет", "null": "Пусто"}.get(text.casefold(), text)
+
+
+def _bookmark_state_text(bookmark: BookmarkInfo) -> str:
+    scope = _scope_label(bookmark.state_scope)
+    values = _saved_values_text(bookmark.saved_values, bookmark.saved_value_count)
+    return f"{scope}; значения: {values}"
+
+
+def _filter_scope_label(value: str) -> str:
+    labels = {
+        "REPORT": "Фильтр отчёта",
+        "PAGE": "Фильтр листа",
+        "VISUAL": "Фильтр визуала",
+    }
+    return labels.get(value.upper(), clean_text(value).replace("_", " ").capitalize())
+
+
+def _filter_type_label(value: str) -> str:
+    labels = {
+        "categorical": "Категориальный",
+        "advanced": "Расширенный",
+        "relative": "Относительный",
+        "relative date": "Относительная дата",
+        "topn": "Первые N",
+        "basic": "Базовый",
+        "unknown": "—",
+    }
+    normalized = clean_text(value).replace("_", " ")
+    return labels.get(normalized.casefold(), normalized or "—")
 
 
 def _issue_summary(model: DocumentationModel) -> str:
@@ -1320,6 +1655,27 @@ def _method_label(aggregation: str | None, object_type: str, usage: str) -> str:
         return "мера DAX"
     labels = {"VISUAL_DATA": "поле визуала", "SLICER": "срез", "TOOLTIP": "подсказка"}
     return labels.get(usage, clean_text(usage))
+
+
+def _visual_role_label(value: str | None) -> str:
+    role = clean_text(value)
+    labels = {
+        "x": "Ось X / категория",
+        "y": "Ось Y / значение",
+        "values": "Значение",
+        "value": "Значение",
+        "category": "Категория",
+        "categories": "Категория",
+        "legend": "Легенда",
+        "series": "Ряд",
+        "rows": "Строки",
+        "columns": "Колонки",
+        "tooltips": "Подсказка",
+        "tooltip": "Подсказка",
+        "size": "Размер",
+        "details": "Детализация",
+    }
+    return labels.get(role.casefold(), role or "—")
 
 
 def _action_label(value: str) -> str:
@@ -1349,6 +1705,44 @@ def _scope_label(value: str | None) -> str:
         "CURRENT_PAGE": "текущий лист",
     }
     return labels.get(value, clean_text(value).replace("_", " ").lower())
+
+
+def _is_internal_date_table(value: str | None) -> bool:
+    folded = clean_text(value).casefold()
+    return folded.startswith(("local", "datetabletemplate"))
+
+
+def _is_internal_field(value: str | None) -> bool:
+    parsed = _qualified_parts(value or "")
+    return _is_internal_date_table(parsed[0] if parsed else value)
+
+
+def _display_or_dash(value: object) -> str:
+    text = clean_text(value)
+    technical_empty = {
+        "",
+        "not_available",
+        "not_found_or_not_available",
+        "unknown",
+        "none",
+        "null",
+    }
+    return "—" if text.casefold() in technical_empty else text
+
+
+def _example_status_label(value: str | None) -> str:
+    labels = {
+        "OK": "—",
+        "PROFILED": "—",
+        "NO_VALUES": "Нет значений",
+        "NOT_PROFILED": "Не проверялось",
+        "PROFILE_FAILED": "Не удалось получить",
+        "IDENTIFIER_OR_HIDDEN": "Служебное или скрытое поле",
+        "HIGH_OR_UNKNOWN_CARDINALITY": "Много значений",
+        "DATE_VALUES_HIDDEN": "Дата; примеры не выводятся",
+        "NUMERIC_VALUES_HIDDEN": "Числовое поле; примеры не выводятся",
+    }
+    return labels.get(clean_text(value).upper(), "—")
 
 
 def clean_text(value: object, *, preserve_newlines: bool = False, limit: int | None = 4_000) -> str:
