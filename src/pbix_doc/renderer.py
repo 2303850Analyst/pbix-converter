@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import zipfile
 from io import BytesIO
@@ -193,7 +194,10 @@ def _canonicalize_package(payload: bytes) -> bytes:
 
 def _add_heading(document: DocumentObject, block: HeadingBlock) -> None:
     text = clean_text(block.text, limit=500)
-    document.add_heading(text, level=min(3, max(1, block.level)))
+    level = min(3, max(1, block.level))
+    paragraph = document.add_heading("", level=level)
+    size, color = {1: (14, BLUE), 2: (12, BLUE), 3: (11, DARK_BLUE)}[level]
+    _add_inline_text(paragraph, text, font_size=size, color=color, bold=True)
 
 
 def _add_section_break(document: DocumentObject, block: SectionBreakBlock) -> None:
@@ -229,17 +233,21 @@ def _add_paragraph(document: DocumentObject, block: ParagraphBlock) -> None:
         paragraph.paragraph_format.right_indent = Inches(0.12)
         paragraph.paragraph_format.space_before = Pt(1)
         paragraph.paragraph_format.space_after = Pt(3)
-    run = paragraph.add_run(clean_text(block.text, preserve_newlines=True, limit=12_000))
     color = RED if block.kind == "warning" else GOLD if block.kind == "status" else "000000"
-    _set_run_font(run, "Arial", 9.5 if block.kind != "normal" else 10, color, bold=block.kind == "status")
+    _add_inline_text(
+        paragraph,
+        clean_text(block.text, preserve_newlines=True, limit=12_000),
+        font_size=9.5 if block.kind != "normal" else 10,
+        color=color,
+        bold=block.kind == "status",
+    )
 
 
 def _add_list(document: DocumentObject, block: ListBlock) -> None:
     style = "List Number" if block.ordered else "List Bullet"
     for item in block.items:
         paragraph = document.add_paragraph(style=style)
-        run = paragraph.add_run(clean_text(item, limit=2_000))
-        _set_run_font(run, "Arial", 10, "000000")
+        _add_inline_text(paragraph, clean_text(item, limit=2_000), font_size=10)
 
 
 def _add_table(document: DocumentObject, block: TableBlock) -> None:
@@ -319,8 +327,13 @@ def _set_cell_text(
     paragraph.paragraph_format.space_after = Pt(0)
     paragraph.paragraph_format.line_spacing = 1.0
     paragraph.paragraph_format.keep_with_next = bold
-    run = paragraph.add_run(clean_text(value, preserve_newlines=True, limit=None))
-    _set_run_font(run, "Arial", font_size, color, bold=bold)
+    _add_inline_text(
+        paragraph,
+        clean_text(value, preserve_newlines=True, limit=None),
+        font_size=font_size,
+        color=color,
+        bold=bold,
+    )
     if fill:
         shading = OxmlElement("w:shd")
         shading.set(qn("w:fill"), fill)
@@ -402,6 +415,28 @@ def _shade_paragraph(paragraph: object, fill: str) -> None:
     shading = OxmlElement("w:shd")
     shading.set(qn("w:fill"), fill)
     properties.append(shading)
+
+
+def _add_inline_text(
+    paragraph: object,
+    text: str,
+    *,
+    font_size: float,
+    color: str = "000000",
+    bold: bool = False,
+    italic: bool | None = None,
+) -> None:
+    position = 0
+    for match in re.finditer(r"\*\*(.+?)\*\*", text, flags=re.DOTALL):
+        if match.start() > position:
+            run = paragraph.add_run(text[position : match.start()])
+            _set_run_font(run, "Arial", font_size, color, bold=bold, italic=italic)
+        run = paragraph.add_run(match.group(1))
+        _set_run_font(run, "Arial", font_size, color, bold=True, italic=italic)
+        position = match.end()
+    if position < len(text) or not paragraph.runs:
+        run = paragraph.add_run(text[position:])
+        _set_run_font(run, "Arial", font_size, color, bold=bold, italic=italic)
 
 
 def _set_style_font(

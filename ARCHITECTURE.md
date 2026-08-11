@@ -71,7 +71,7 @@ CLI / Controller
     -> Atomic Writer
 ```
 
-`DocumentProjector` receives the normalized and policy-safe domain model and derives the field registry, unified page composition, user-facing KPI lineage, same-name comparison groups, explicit context evidence, bookmark cards, navigation indexes, and document-local references. The DOCX renderer receives only `SafeDocumentModel`. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, the normalized PBIX model, or unsanitized values.
+`DocumentProjector` receives the normalized and policy-safe domain model and derives the field registry, page-grouped composition, bookmark and filter registers, user-facing KPI lineage, same-name comparison groups, explicit context evidence, navigation indexes, and document-local references. The DOCX renderer receives only `SafeDocumentModel`. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, the normalized PBIX model, or unsanitized values.
 
 Immediately after the report-level filters, the projector emits a single field registry. It combines every locally discovered semantic column, measure, calculated column, report field reference, filter reference, visual usage, aggregation, and DAX dependency. NativeQuery is never executed or copied into the safe document model: the semantic adapter retains only normalized source-column names and data-type declarations extracted from model metadata, SQL `CAST`/`CONVERT`, or Power Query type steps.
 
@@ -172,7 +172,8 @@ Default behavior:
 ```text
 Raw table rows:                  never output
 Measure results:                never calculated or output
-Saved filter/bookmark literals: up to twenty distinct metadata values per object
+Saved filter literals: up to twenty distinct metadata values per object
+Bookmark literals: only with a reliable qualified-field association, under the same cap
 Continuous numeric values:      hidden
 Identifiers and keys:           hidden
 Categorical examples:           maximum five
@@ -183,7 +184,7 @@ Power Query definitions:        included only after sanitization
 
 Report object counts, coordinates, model cardinality, technical versions, and other metadata are not treated as business fact values.
 
-Filter and bookmark literals are read only from report metadata, normalized by the report adapter, and capped before reaching the projector. They never come from table-row profiling. Disallowed column values are discarded before the normalized model reaches the projector.
+Filter and bookmark literals are read only from report metadata, normalized by the report adapter, and capped before reaching the projector. Bookmark literals are user-facing only when they can be associated with a qualified field. They never come from table-row profiling. Disallowed column values are discarded before the normalized model reaches the projector.
 
 ## 8. Normalized domain model
 
@@ -227,7 +228,8 @@ Each normalized semantic column may additionally retain `format_string`, `source
 - short stable document-local IDs for pages, visuals, KPI definitions, bookmarks, and navigation edges;
 - symbolic KPI dependency chains without evaluating DAX;
 - usage locations and explicit report/page/visual/bookmark context evidence;
-- a unified page-composition register for visuals, controls, and bookmarks;
+- page-grouped composition tables for visuals, controls, and bookmarks;
+- complete bookmark and filter registers;
 - groups of identical visible titles used with different semantic objects or contexts;
 - incoming and outgoing navigation indexes and direct user journeys;
 - `PARTIAL`, `UNRESOLVED`, and overflow markers.
@@ -248,12 +250,11 @@ DAX
 Варианты агрегаций
 ```
 
-The first header is rendered as `Таблица[Поле]`. The registry includes model objects even when they are unused by a visual, except Power BI helper objects whose table name starts with `Local` or `DateTableTemplate_`. The PBI type cell contains only the normalized type value, without object-kind or display-format prefixes; numeric TOM type codes are mapped to their names. Cross-references use the document-local page and visual IDs together with their human-readable names. DAX expressions use the normal token-aware sanitization policy, and the dependency column lists formula object names rather than evaluated results. The explanation column is intentionally empty and is never populated automatically. Missing or inapplicable type/source cells contain an em dash. Numeric aggregation enums are normalized and deduplicated into comma-separated names such as `По умолчанию, SUM, COUNT` or `Без агрегации`; bare enum numbers are not user-facing output.
+The first header is rendered as `Таблица[Поле]`. The registry includes model objects even when they are unused by a visual, except service objects whose table name starts with `Local`, `DateTableTemplate`, `H$`, `R$`, or `U$`. The PBI type cell contains only the normalized type value, without object-kind or display-format prefixes; numeric TOM type codes are mapped to their names. Cross-references use the document-local page and visual IDs together with their typed human-readable names. DAX expressions use the normal token-aware sanitization policy, and the dependency column lists formula object names rather than evaluated results. The explanation column is intentionally empty and is never populated automatically. Missing or inapplicable type/source cells contain an em dash. Numeric aggregation enums are normalized and deduplicated into comma-separated names such as `По умолчанию, SUM, COUNT` or `Без агрегации`; bare enum numbers are not user-facing output.
 
-Immediately after the field registry, the projector emits one `Состав листа` table with the fixed columns:
+Immediately after the field registry, the projector emits `Состав листа` as one titled group per report page. Each page group contains a table with the fixed columns:
 
 ```text
-Лист
 Элемент
 Название
 Тип и назначение
@@ -264,7 +265,11 @@ Immediately after the field registry, the projector emits one `Состав ли
 Действие / переход
 ```
 
-The `Элемент` cell is the sole place where a bare local ID is sufficient. All other references use `Name (ID)`. Missing visual titles are replaced with a purpose-based label; bookmark rows include the associated page, captured state, affected fields and calculations, and the controls that invoke them when those links are available in metadata.
+The page name and ID are carried by the group heading, so the repeated `Лист` column is omitted. The `Элемент` cell is the sole place where a bare local ID is sufficient. The composition groups are followed by the complete `Все закладки` and `Все фильтры` registers.
+
+In mixed text every reference contains the explicit entity type, a bold human-readable name in guillemets, and the local ID: `лист «Обзор» (P01)`, `закладка «Исходный вид» (B01)`, `кнопка «Сбросить представление» (V010)`, or `вычисление «Выручка» (K001)`. A dedicated column may omit the repeated type word but retains the quoted name and ID. Technical references such as `Sales[Region]` remain unquoted. Human-readable model-table, query, role, page, bookmark, visual, and calculation names are quoted. The wording remains complete when Confluence strips bold formatting.
+
+Missing visual titles are replaced with a purpose-based label; bookmark rows include the associated page, captured scope, affected elements, and controls that invoke them when those links are available in metadata. Bookmark saved literals are not presented as field values unless metadata provides a reliable field association.
 
 The comparison taxonomy is fixed:
 
@@ -312,7 +317,7 @@ Supported edge categories include:
 
 The processor builds a directed navigation graph and derives outgoing and incoming connections for each page. It reports missing bookmark/page targets, bookmarks with no discovered report entry point, links to hidden pages, and navigation cycles as diagnostics. A bookmark without a discovered button is not automatically invalid because it can still be used from the bookmark pane or other Power BI state.
 
-Saved slicer/filter values inside bookmarks may be shown from report metadata under the same twenty-value cap. Raw table rows and evaluated measure results remain prohibited.
+Saved slicer/filter values inside bookmarks may be shown only when report metadata reliably associates them with a qualified field, under the same twenty-value cap. Raw table rows and evaluated measure results remain prohibited.
 
 ## 10. RLS and OLS output
 
@@ -416,20 +421,22 @@ Diagnostics are printed to the console but the internal extraction-diagnostics t
 1. Report passport, extraction status, and terminology
 2. Report-level filters
 3. Complete field registry
-4. Unified page composition table
-5. Same visible name — possible structural or context differences
-6. KPI and calculation catalog
-7. Page and visual guide
-8. Buttons, bookmarks, navigators, tooltip, and drillthrough
-9. Direct user journeys
-10. Semantic model and relationships
-11. Power Query and sources
-12. RLS and OLS
+4. Page composition grouped by page
+5. Complete bookmark register
+6. Complete filter register
+7. Same visible name — possible structural or context differences
+8. KPI and calculation catalog
+9. Page and visual guide
+10. Buttons, navigators, tooltip, and drillthrough
+11. Direct user journeys
+12. Semantic model and relationships
+13. Power Query and sources
+14. RLS and OLS
 ```
 
-The unified `Состав листа` table immediately follows the field registry. It has one row per visual, control, or bookmark and the fixed columns: page, element, name, type/purpose, fields/measures, calculation/DAX, context/filters, related bookmarks, and action/target. Visual filter context is rendered only as scope plus qualified field (`Фильтр листа: Table[Field]`); ambiguous saved literals and filter-type labels are not rendered in this compact column. The `Элемент` column contains only the local ID. Every cross-reference outside that column uses the durable human-readable form `Name (ID)`; when metadata has no visible title, the projector supplies a purpose-based fallback such as `Кнопка навигации (V004)`.
+`Состав листа` immediately follows the field registry. Each page has its own heading and an eight-column table: element, name, type/purpose, fields/measures, calculation/DAX, context/filters, related bookmarks, and action/target. Visual filter context is rendered only as scope plus qualified field (`Фильтр листа по полю Table[Field]`); saved literals are centralized in `Все фильтры`. The `Элемент` column contains only the local ID. The following `Все закладки` table documents bookmark group, associated page, entry points, target, affected elements, saved scope, and user-visible effect. `Все фильтры` documents report, page, and visual filters with their qualified fields, condition/type, saved values, scope of application, related bookmarks, and extraction status.
 
-The DOCX uses the `compact_reference_guide` design preset with an Arial 10 pt body, built-in `Heading 1`–`Heading 3`, a monospaced code style for DAX, and native Word tables. All sections use A4 landscape orientation, narrow margins, compact paragraph spacing, and reduced cell padding. Ordinary tables expand to the available landscape width; the field registry remains an 11-column compact table and the page-composition register remains a 9-column compact table. All tables have explicit fixed geometry, repeated header rows, and no merged or nested cells; ordinary tables have at most five columns. Registry and page-composition rows may continue across pages when their sanitized DAX is long. Color is never the sole carrier of meaning. Critical navigation does not depend on Word hyperlinks surviving Confluence import.
+The DOCX uses the `compact_reference_guide` design preset with an Arial 10 pt body, built-in `Heading 1`–`Heading 3`, a monospaced code style for DAX, and native Word tables. All sections use A4 landscape orientation, narrow margins, compact paragraph spacing, and reduced cell padding. Ordinary tables expand to the available landscape width; the field registry remains an 11-column compact table and page composition uses eight columns. All tables have explicit fixed geometry, repeated header rows, and no merged or nested cells. Registry and page-composition rows may continue across pages when their sanitized DAX is long. Color is never the sole carrier of meaning. Critical navigation does not depend on Word hyperlinks surviving Confluence import.
 
 The package is macro-free OOXML. Before publication, `OOXMLValidator` rejects macros, OLE/ActiveX or embedded objects, remote templates, external relationships, external hyperlinks, automatic fields, unsafe member paths, duplicate members, invalid XML, disallowed control characters, and package or part size violations. The writer uses a same-directory temporary file, validates it, fsyncs it, and performs atomic replacement where the filesystem supports it.
 
@@ -463,6 +470,7 @@ src/pbix_doc/
 ├── report.py
 ├── semantic.py
 ├── domain.py
+├── policy.py
 ├── projector.py
 ├── ooxml.py
 └── renderer.py

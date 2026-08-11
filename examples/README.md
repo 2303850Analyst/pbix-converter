@@ -19,4 +19,4 @@ python main.py examples\synthetic_representative.pbix examples\synthetic_represe
 
 `synthetic_representative_documentation.docx` is the reviewed golden example intended for manual import into Atlassian Confluence Data Center.
 Its field registry is populated from the report bindings and demonstrates both `SUM` and `COUNT`. Missing PBI type and source metadata is rendered as an em dash because this synthetic fixture intentionally has no embedded `DataModel`.
-The following `Состав листа` table demonstrates visual, bookmark, filter, DAX, and navigation cross-references in the `Human-readable name (ID)` form.
+The `Состав листа` section is grouped by page and followed by the complete bookmark and filter registers. Cross-references use an explicit entity type, a quoted human-readable name, and a local ID, for example `лист «Обзор» (P01)`.

@@ -31,11 +31,15 @@ from pbix_doc.domain import (
     FileInfo,
     FilterInfo,
     MeasureInfo,
+    QueryInfo,
+    RelationshipInfo,
+    SecurityRule,
     SemanticModelInfo,
     TableInfo,
 )
 from pbix_doc.cli import build_parser, main
 from pbix_doc.pipeline import Options, generate_documentation, resolve_fields
+from pbix_doc.policy import METADATA_EXCLUSION_POLICY
 from pbix_doc.ooxml import UnsafeDocxError, validate_docx
 from pbix_doc.projector import HeadingBlock, SafeDocumentModel, TableBlock, project_document, sanitize_dax
 from pbix_doc.renderer import atomic_write, render_document
@@ -367,6 +371,27 @@ class RendererTests(unittest.TestCase):
                     "synthetic-regression",
                 )
             )
+            details_revenue.fields.append(
+                FieldRef(
+                    "H$Storage",
+                    "Index",
+                    "COLUMN",
+                    "Y",
+                    "VISUAL_DATA",
+                    "SUM",
+                    "synthetic-regression",
+                )
+            )
+            details_revenue.filters.append(
+                FilterInfo(
+                    "VISUAL",
+                    "R$Relationship[Index]",
+                    "Categorical",
+                    1,
+                    "synthetic-regression",
+                    ["internal"],
+                )
+            )
             report.pages[0].filters.append(
                 FilterInfo(
                     "PAGE",
@@ -437,6 +462,24 @@ class RendererTests(unittest.TestCase):
                         "Import",
                         [ColumnInfo("DateTableTemplate_456", "Month", "String", True, 12)],
                     ),
+                    TableInfo(
+                        "H$Storage",
+                        True,
+                        "Import",
+                        [ColumnInfo("H$Storage", "Index", "Int64", True, 1)],
+                    ),
+                    TableInfo(
+                        "R$Relationship",
+                        True,
+                        "Import",
+                        [ColumnInfo("R$Relationship", "Index", "Int64", True, 1)],
+                    ),
+                    TableInfo(
+                        "U$Hierarchy",
+                        True,
+                        "Import",
+                        [ColumnInfo("U$Hierarchy", "Index", "Int64", True, 1)],
+                    ),
                 ],
                 measures=[
                     MeasureInfo(
@@ -446,8 +489,37 @@ class RendererTests(unittest.TestCase):
                         None,
                         None,
                         None,
+                    ),
+                    MeasureInfo(
+                        "Sales",
+                        "Uses internal storage",
+                        "SUM('H$Storage'[Index]) + [Selected region]",
+                        None,
+                        None,
+                        None,
+                    ),
+                    MeasureInfo(
+                        "U$Hierarchy",
+                        "Internal measure",
+                        "COUNTROWS('U$Hierarchy')",
+                        None,
+                        None,
+                        None,
+                    ),
+                ],
+                relationships=[
+                    RelationshipInfo(
+                        "Sales[Region]",
+                        "R$Relationship[Index]",
+                        "ManyToOne",
+                        True,
+                        "Single",
+                        None,
                     )
                 ],
+                queries=[QueryInfo("H$Storage", "POWER_QUERY", True)],
+                rls=[SecurityRule("RLS", "Internal", "R$Relationship", None, "TRUE()", "Read")],
+                ols=[SecurityRule("OLS", "Internal", "U$Hierarchy", "Index", None, "None")],
             )
             resolve_fields(report.pages, semantic, issues)
             model = DocumentationModel(
@@ -461,7 +533,9 @@ class RendererTests(unittest.TestCase):
             payload = render_document(project_document(model))
             text = read_docx_text(payload)
 
-        self.assertIn("Кнопки, закладки и переходы", text)
+        self.assertIn("Кнопки и переходы", text)
+        self.assertIn("Все закладки", text)
+        self.assertIn("Все фильтры", text)
         self.assertIn("Пользовательские маршруты", text)
         self.assertIn("Одинаковое название — возможные различия", text)
         self.assertIn("РАЗЛИЧИЕ ОПРЕДЕЛЕНИЙ", text)
@@ -482,6 +556,11 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn("<IDENTIFIER_OR_HIDDEN>", text)
         self.assertNotIn("LocalDateTable_", text)
         self.assertNotIn("DateTableTemplate_", text)
+        self.assertNotIn("H$Storage", text)
+        self.assertNotIn("R$Relationship", text)
+        self.assertNotIn("U$Hierarchy", text)
+        self.assertIn("Uses internal storage", text)
+        self.assertIn("<СЛУЖЕБНАЯ ССЫЛКА>", text)
         self.assertNotIn("RLS и OLS — формальная заглушка", text)
         self.assertNotIn("Статус анализа: PROVISIONAL", text)
         self.assertNotIn("Диагностика извлечения", text)
@@ -495,6 +574,10 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn("V001 ·", text)
         self.assertNotIn("B01 ·", text)
         self.assertNotIn("K001 ·", text)
+        self.assertNotIn("**", text)
+        self.assertIn("лист «Обзор» (P01)", text)
+        self.assertIn("закладка «Исходный вид» (B01)", text)
+        self.assertIn("таблица «Sales»", text)
         self.assertIn("Ось Y / значение", text)
         self.assertNotIn(str(path.resolve()), text)
         self.assertIn("Источник", text)
@@ -505,13 +588,22 @@ class RendererTests(unittest.TestCase):
         table_headers = [tuple(cell.text for cell in table.rows[0].cells) for table in document.tables]
         filter_index = next(index for index, row in enumerate(table_headers) if row[0] == "Область")
         registry_index = next(index for index, row in enumerate(table_headers) if row[0] == "Таблица[Поле]")
-        composition_index = next(
+        composition_indexes = [
             index
             for index, row in enumerate(table_headers)
-            if row[:2] == ("Лист", "Элемент")
+            if row[:2] == ("Элемент", "Название")
+        ]
+        composition_index = composition_indexes[0]
+        bookmarks_index = next(
+            index for index, row in enumerate(table_headers) if row[:2] == ("Закладка", "Группа")
+        )
+        filters_index = next(
+            index
+            for index, row in enumerate(table_headers)
+            if row[:2] == ("Область", "Источник фильтра")
         )
         registry = document.tables[registry_index]
-        composition = document.tables[composition_index]
+        compositions = [document.tables[index] for index in composition_indexes]
         registry_rows = {row.cells[0].text: row for row in registry.rows[1:]}
         self.assertEqual(registry_index, filter_index + 1)
         self.assertEqual(composition_index, registry_index + 1)
@@ -535,7 +627,6 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(
             table_headers[composition_index],
             (
-                "Лист",
                 "Элемент",
                 "Название",
                 "Тип и назначение",
@@ -546,23 +637,36 @@ class RendererTests(unittest.TestCase):
                 "Действие / переход",
             ),
         )
-        composition_rows = {row.cells[1].text: row for row in composition.rows[1:]}
+        self.assertEqual(bookmarks_index, composition_indexes[-1] + 1)
+        self.assertEqual(filters_index, bookmarks_index + 1)
+        composition_rows = {
+            row.cells[0].text: row
+            for table in compositions
+            for row in table.rows[1:]
+        }
         self.assertTrue(all(re.fullmatch(r"[VB]\d{2,3}", key) for key in composition_rows))
-        self.assertIn("Обзор (P01)", {row.cells[0].text for row in composition.rows[1:]})
-        self.assertEqual(composition_rows["B01"].cells[2].text, "Исходный вид")
-        self.assertIn("Исходный вид (B01)", composition_rows["V001"].cells[7].text)
-        self.assertIn("Детали (P02)", composition_rows["V003"].cells[8].text)
-        self.assertIn("Sales[Selected region]", composition_rows["V002"].cells[5].text)
-        self.assertIn("CALCULATE", composition_rows["V002"].cells[5].text)
-        self.assertIn('"<VALUE>"', composition_rows["V002"].cells[5].text)
-        self.assertIn("Вернуть обзор (V004)", composition_rows["B01"].cells[8].text)
+        self.assertEqual(composition_rows["B01"].cells[1].text, "«Исходный вид»")
+        self.assertIn("закладка «Исходный вид» (B01)", composition_rows["V001"].cells[6].text)
+        self.assertIn("лист «Детали» (P02)", composition_rows["V003"].cells[7].text)
+        self.assertIn("Sales[Selected region]", composition_rows["V002"].cells[4].text)
+        self.assertIn("CALCULATE", composition_rows["V002"].cells[4].text)
+        self.assertIn('"<VALUE>"', composition_rows["V002"].cells[4].text)
+        self.assertIn("кнопка «Вернуть обзор» (V004)", composition_rows["B01"].cells[7].text)
         self.assertEqual(
-            composition_rows["V001"].cells[6].text,
-            "Фильтр отчёта: Sales[Region]; Фильтр листа: Sales[Region]",
+            composition_rows["V001"].cells[5].text,
+            "Фильтр отчёта по полю Sales[Region]; Фильтр листа по полю Sales[Region]",
         )
-        self.assertNotIn("Пусто", composition_rows["V001"].cells[6].text)
-        self.assertNotIn("Да", composition_rows["V001"].cells[6].text)
-        self.assertNotIn("Категориальный", composition_rows["V001"].cells[6].text)
+        self.assertNotIn("Пусто", composition_rows["V001"].cells[5].text)
+        self.assertNotIn("Да", composition_rows["V001"].cells[5].text)
+        self.assertNotIn("Категориальный", composition_rows["V001"].cells[5].text)
+        bookmark_rows = {
+            row.cells[0].text: row for row in document.tables[bookmarks_index].rows[1:]
+        }
+        self.assertIn("«Исходный вид» (B01)", bookmark_rows)
+        self.assertIn("лист «Обзор» (P01)", bookmark_rows["«Исходный вид» (B01)"].cells[4].text)
+        filter_rows = document.tables[filters_index].rows[1:]
+        self.assertTrue(any(row.cells[2].text == "Sales[Region]" for row in filter_rows))
+        self.assertTrue(any("Секретный регион" in row.cells[4].text for row in filter_rows))
         self.assertTrue(all(row.cells[3].text == "" for row in registry.rows[1:]))
         self.assertFalse(any(name.casefold().startswith("local") for name in registry_rows))
         self.assertEqual(registry_rows["Sales[Region]"].cells[2].text, "String")
@@ -581,6 +685,23 @@ class RendererTests(unittest.TestCase):
             registry_rows["Sales[Amount]"].cells[10].text,
             "По умолчанию, SUM, COUNT",
         )
+        bold_reference_names = {
+            run.text
+            for paragraph in document.paragraphs
+            for run in paragraph.runs
+            if run.bold
+        }
+        for table in document.tables:
+            bold_reference_names.update(
+                run.text
+                for row in table.rows
+                for cell in row.cells
+                for paragraph in cell.paragraphs
+                for run in paragraph.runs
+                if run.bold
+            )
+        self.assertIn("«Обзор»", bold_reference_names)
+        self.assertIn("«Sales»", bold_reference_names)
         self.assertTrue(all(section.orientation == WD_ORIENT.LANDSCAPE for section in document.sections))
         with zipfile.ZipFile(BytesIO(payload)) as archive:
             names = archive.namelist()
@@ -592,6 +713,8 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn(b"vbaProject", b"\n".join(name.encode() for name in names))
         self.assertIn(b"w:tblGrid", document_xml)
         self.assertIn(b"w:tblHeader", document_xml)
+        for excluded in (b"LocalDateTable", b"DateTableTemplate", b"H$", b"R$", b"U$"):
+            self.assertNotIn(excluded, document_xml)
 
     def test_atomic_writer_publishes_valid_docx(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -616,11 +739,30 @@ class RendererTests(unittest.TestCase):
 
     def test_dax_sanitizer_is_token_aware_and_fails_closed(self) -> None:
         safe = sanitize_dax('CALCULATE([Revenue], Sales[Region] = "N""orth") // secret')
+        compact = sanitize_dax(
+            """
+            VAR/* note */Result =
+                CALCULATE (
+                    SUM ( Sales[Amount] ),
+                    'Sales  Facts'[Region Name] = "North"
+                )
+            RETURN
+                Result
+            """
+        )
+        redacted = sanitize_dax("SUM('H$Storage'[Index]) + [Revenue]")
         malformed = sanitize_dax('CALCULATE([Revenue], "unfinished)')
         self.assertEqual(safe.status, "OK")
         self.assertIn('"<VALUE>"', safe.text or "")
         self.assertNotIn("secret", safe.text or "")
         self.assertIn("[Revenue]", safe.references)
+        self.assertEqual(
+            compact.text,
+            "VAR Result = CALCULATE(SUM(Sales[Amount]), 'Sales  Facts'[Region Name] = \"<VALUE>\") RETURN Result",
+        )
+        self.assertEqual(redacted.text, "SUM(<СЛУЖЕБНАЯ ССЫЛКА>) + [Revenue]")
+        self.assertEqual(redacted.status, "PARTIAL")
+        self.assertEqual(redacted.references, ["[Revenue]"])
         self.assertEqual(malformed.status, "PARTIAL")
         self.assertIsNone(malformed.text)
 
@@ -728,6 +870,18 @@ class PipelineTests(unittest.TestCase):
 
 
 class RuntimePolicyTests(unittest.TestCase):
+    def test_metadata_exclusion_policy_handles_tables_and_qualified_references(self) -> None:
+        for value in (
+            "LocalDateTable_123[Date]",
+            "DateTableTemplate_456[Month]",
+            "H$Storage[Index]",
+            "'R$Relationship'[Index]",
+            "u$Hierarchy",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(METADATA_EXCLUSION_POLICY.excludes(value))
+        self.assertFalse(METADATA_EXCLUSION_POLICY.excludes("BusinessLocality[Name]"))
+
     def test_stale_owned_workspace_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -820,13 +974,20 @@ class ProfilerTests(unittest.TestCase):
         region = ColumnInfo("Access", "Region", "string", False, 8)
         login = ColumnInfo("Access", "UserLogin", "string", False, 8)
         amount = ColumnInfo("Access", "AmountBand", "int64", False, 3)
+        internal = ColumnInfo("H$Storage", "Index", "string", False, 1)
         semantic = SemanticModelInfo(
             "EMBEDDED",
-            tables=[TableInfo("Access", False, "Import", [region, login, amount])],
+            tables=[
+                TableInfo("Access", False, "Import", [region, login, amount]),
+                TableInfo("H$Storage", True, "Import", [internal]),
+            ],
         )
 
         class FakeModel:
-            def iter_table(self, *_: object, **__: object):
+            calls: list[str] = []
+
+            def iter_table(self, table_name: str, *_: object, **__: object):
+                self.calls.append(table_name)
                 yield pd.DataFrame(
                     {
                         "Region": ["A", "A", "B", "C", "D", "E", "F", "person@example.org"],
@@ -839,6 +1000,8 @@ class ProfilerTests(unittest.TestCase):
         self.assertEqual(region.examples, ["A", "B", "C", "D", "E"])
         self.assertEqual(login.example_status, "IDENTIFIER_OR_HIDDEN")
         self.assertEqual(amount.example_status, "NUMERIC_VALUES_HIDDEN")
+        self.assertEqual(internal.example_status, "NOT_PROFILED")
+        self.assertEqual(FakeModel.calls, ["Access"])
         self.assertFalse(issues)
 
 

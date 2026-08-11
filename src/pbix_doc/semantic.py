@@ -17,6 +17,7 @@ from .domain import (
     SemanticModelInfo,
     TableInfo,
 )
+from .policy import METADATA_EXCLUSION_POLICY
 
 
 SENSITIVE_NAME_PARTS = (
@@ -622,6 +623,8 @@ def profile_examples(
 ) -> None:
     candidates: dict[str, list[ColumnInfo]] = defaultdict(list)
     for table in semantic.tables:
+        if METADATA_EXCLUSION_POLICY.excludes(table.name):
+            continue
         for column in table.columns:
             if table.hidden or column.hidden or is_sensitive_column(column.name):
                 column.example_status = "IDENTIFIER_OR_HIDDEN"
