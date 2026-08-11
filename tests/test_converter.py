@@ -43,7 +43,14 @@ from pbix_doc.policy import METADATA_EXCLUSION_POLICY
 from pbix_doc.ooxml import UnsafeDocxError, validate_docx
 from pbix_doc.projector import HeadingBlock, SafeDocumentModel, TableBlock, project_document, sanitize_dax
 from pbix_doc.renderer import atomic_write, render_document
-from pbix_doc.report import aggregation_name, extract_saved_values, extract_title, parse_report
+from pbix_doc.report import (
+    aggregation_name,
+    extract_saved_values,
+    extract_title,
+    filter_operator,
+    parse_report,
+    safe_external_target,
+)
 from pbix_doc.runtime import (
     WORKSPACE_MARKER,
     WORKSPACE_PREFIX,
@@ -54,6 +61,7 @@ from pbix_doc.runtime import (
     install_runtime_guards,
 )
 from pbix_doc.semantic import (
+    extract_power_query_connection_types,
     extract_native_types,
     load_semantic_model,
     profile_examples,
@@ -304,6 +312,19 @@ class ReportParserTests(unittest.TestCase):
         self.assertEqual(values, [str(index) for index in range(20)])
         self.assertEqual(count, 25)
 
+    def test_external_url_is_shown_without_credentials_or_parameters(self) -> None:
+        self.assertEqual(
+            safe_external_target("https://user:secret@example.test/report?id=42#page"),
+            "https://example.test/report",
+        )
+        self.assertEqual(safe_external_target("dynamic-url-expression"), "Адрес определяется динамически")
+
+    def test_filter_operator_respects_not_wrapper(self) -> None:
+        self.assertEqual(
+            filter_operator({"Not": {"Expression": {"In": [{"Literal": {"Value": "A"}}]}}}),
+            "NOT_IN",
+        )
+
     def test_aggregation_codes_are_rendered_as_names(self) -> None:
         expected = {
             0: "SUM",
@@ -357,6 +378,8 @@ class RendererTests(unittest.TestCase):
             issues = []
             with PbixContainer(path) as container:
                 report = parse_report(container, path.stem, issues)
+            unnamed_chart = next(item for item in report.pages[0].visuals if item.id == "chart")
+            unnamed_chart.title = "356810a1d29047eea77442279e6f909a"
             details_revenue = next(
                 item for item in report.pages[1].visuals if item.id == "details_revenue"
             )
@@ -547,7 +570,7 @@ class RendererTests(unittest.TestCase):
         self.assertIn("Реестр полей отчёта", text)
         self.assertIn("Состав листа", text)
         self.assertIn("Варианты названий", text)
-        self.assertIn("Наименование в источнике", text)
+        self.assertIn("Наименование поля таблицы в источнике", text)
         self.assertIn("Sales[Region]", text)
         self.assertIn("region_code", text)
         self.assertIn("SQL: varchar(20); M: type text", text)
@@ -638,7 +661,7 @@ class RendererTests(unittest.TestCase):
                 "Объяснение",
                 "DAX",
                 "Упоминается на листе",
-                "Наименование в источнике",
+                "Наименование поля таблицы в источнике",
                 "Тип данных в источнике",
                 "Используется в DAX",
                 "Используется в визуалах",
@@ -673,6 +696,8 @@ class RendererTests(unittest.TestCase):
         self.assertIn("CALCULATE", composition_rows["V002"].cells[4].text)
         self.assertIn('"<VALUE>"', composition_rows["V002"].cells[4].text)
         self.assertIn("кнопка «Вернуть обзор» (V004)", composition_rows["B01"].cells[7].text)
+        self.assertEqual(composition_rows["V001"].cells[1].text, "«Без названия 1»")
+        self.assertIn("«Без названия 1»", registry_rows["Sales[Region]"].cells[1].text)
         self.assertEqual(
             composition_rows["V001"].cells[5].text,
             "Фильтр отчёта по полю Sales[Region]; Фильтр листа по полю Sales[Region]",
@@ -691,6 +716,7 @@ class RendererTests(unittest.TestCase):
         filter_rows = document.tables[filters_index].rows[1:]
         self.assertTrue(any(row.cells[2].text == "Sales[Region]" for row in filter_rows))
         self.assertTrue(any("Секретный регион" in row.cells[4].text for row in filter_rows))
+        self.assertTrue(all(row.cells[3].text == "Выбраны значения" for row in filter_rows))
         self.assertTrue(all(row.cells[3].text == "" for row in registry.rows[1:]))
         self.assertFalse(any(name.casefold().startswith("local") for name in registry_rows))
         self.assertEqual(registry_rows["Sales[Region]"].cells[2].text, "String")
@@ -1111,6 +1137,8 @@ class SemanticAdapterTests(unittest.TestCase):
         self.assertEqual(column.source_column, "amount_net")
         self.assertEqual(column.native_data_type, "SQL: decimal(18,2); M: Currency.Type")
         self.assertEqual(column.summarize_by, "SUM")
+        self.assertEqual(semantic.queries[0].connection_types, ["SQL Server"])
+        self.assertEqual(semantic.connection_types, ["SQL Server"])
         self.assertNotIn("server", repr(semantic))
         self.assertNotIn("SELECT CAST", repr(semantic))
         self.assertFalse(issues)
@@ -1129,6 +1157,51 @@ class SemanticAdapterTests(unittest.TestCase):
             extract_native_types(expression),
             {"amount_net": ["SQL: decimal(18,2)", "M: Currency.Type"]},
         )
+
+    def test_power_query_connectors_are_detected_without_source_arguments(self) -> None:
+        expression = (
+            'let Db = Sql.Database("server", "database"), '
+            'File = Excel.Workbook(File.Contents("private.xlsx")) in Db'
+        )
+        self.assertEqual(
+            extract_power_query_connection_types(expression),
+            ["Excel", "SQL Server", "Файл"],
+        )
+
+    def test_mashup_queries_are_included_and_parameters_are_skipped(self) -> None:
+        class FakeModel:
+            tmschema_tables: list[dict[str, object]] = []
+            tmschema_columns: list[dict[str, object]] = []
+            schema: list[dict[str, object]] = []
+            statistics: list[dict[str, object]] = []
+            dax_columns: list[dict[str, object]] = []
+            tables: list[dict[str, object]] = []
+            dax_measures: list[dict[str, object]] = []
+            relationships: list[dict[str, object]] = []
+            power_query: list[dict[str, object]] = []
+            mashup_queries = [
+                {
+                    "Name": "Sales",
+                    "Kind": "Query",
+                    "IsParameter": False,
+                    "Expression": 'let Source = Odbc.DataSource("dsn=private") in Source',
+                },
+                {
+                    "Name": "Environment",
+                    "Kind": "Parameter",
+                    "IsParameter": True,
+                    "Expression": '"production"',
+                },
+            ]
+            rls: list[dict[str, object]] = []
+            ols: list[dict[str, object]] = []
+            connections: list[dict[str, object]] = []
+
+        semantic = read_model_metadata(FakeModel(), [])
+
+        self.assertEqual([query.name for query in semantic.queries], ["Sales"])
+        self.assertEqual(semantic.queries[0].connection_types, ["ODBC"])
+        self.assertNotIn("private", repr(semantic))
 
 
 if __name__ == "__main__":

@@ -377,12 +377,15 @@ def extract_filters(node: Any, scope: str, source_path: str) -> list[FilterInfo]
         expression = next(semantic_expressions(candidate), None)
         field = field_from_expression(expression, aliases, None, f"{scope}_FILTER", source_path)
         field_name = field.qualified_name if field else "<НЕРАЗРЕШЁННОЕ ПОЛЕ>"
-        filter_type = named_scalar(candidate, ("type", "filterType", "howCreated")) or "UNKNOWN"
+        condition = filter_condition(candidate)
+        filter_type = filter_operator(condition) or named_scalar(
+            candidate, ("type", "filterType", "howCreated")
+        ) or "UNKNOWN"
         key = (scope, field_name, filter_type)
         if key in seen:
             continue
         seen.add(key)
-        saved_values, saved_value_count = extract_saved_values(candidate)
+        saved_values, saved_value_count = extract_saved_values(condition)
         result.append(
             FilterInfo(
                 scope,
@@ -394,6 +397,71 @@ def extract_filters(node: Any, scope: str, source_path: str) -> list[FilterInfo]
             )
         )
     return result
+
+
+def filter_condition(candidate: Any) -> Any:
+    if not isinstance(candidate, dict):
+        return candidate
+    for key in ("condition", "Condition", "where", "Where", "filterExpression"):
+        value = candidate.get(key)
+        if isinstance(value, (dict, list)):
+            return value
+    nested_filter = candidate.get("filter")
+    if isinstance(nested_filter, (dict, list)):
+        for item in walk(nested_filter):
+            if not isinstance(item, dict):
+                continue
+            for key in ("condition", "Condition", "where", "Where"):
+                value = item.get(key)
+                if isinstance(value, (dict, list)):
+                    return value
+        return nested_filter
+    return candidate
+
+
+def filter_operator(condition: Any) -> str | None:
+    operators = {
+        "in": "IN",
+        "notin": "NOT_IN",
+        "between": "BETWEEN",
+        "contains": "CONTAINS",
+        "startswith": "STARTS_WITH",
+        "endswith": "ENDS_WITH",
+        "greaterthan": "GREATER_THAN",
+        "greaterthanorequal": "GREATER_THAN_OR_EQUAL",
+        "lessthan": "LESS_THAN",
+        "lessthanorequal": "LESS_THAN_OR_EQUAL",
+        "equals": "EQUALS",
+        "notequals": "NOT_EQUALS",
+        "topn": "TOP_N",
+    }
+    inverse = {
+        "IN": "NOT_IN",
+        "EQUALS": "NOT_EQUALS",
+        "CONTAINS": "NOT_CONTAINS",
+    }
+
+    def detect(node: Any) -> str | None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                normalized = re.sub(r"[^a-z]", "", str(key).casefold())
+                if normalized == "not":
+                    nested = detect(value)
+                    return inverse.get(nested or "", nested)
+                if normalized in operators:
+                    return operators[normalized]
+            for value in node.values():
+                nested = detect(value)
+                if nested:
+                    return nested
+        elif isinstance(node, list):
+            for value in node:
+                nested = detect(value)
+                if nested:
+                    return nested
+        return None
+
+    return detect(condition)
 
 
 def extract_saved_values(node: Any) -> tuple[list[str], int]:
@@ -864,7 +932,7 @@ def build_navigation(report: ReportInfo, issues: list[Issue]) -> None:
                         status = "RESOLVED"
                 elif "url" in folded_type:
                     target_kind = "EXTERNAL"
-                    target_name = "<ВНЕШНЯЯ ССЫЛКА СКРЫТА>"
+                    target_name = safe_external_target(target)
                     target_id = None
                     status = "RESOLVED"
                 elif "back" in folded_type:
@@ -901,6 +969,17 @@ def build_navigation(report: ReportInfo, issues: list[Issue]) -> None:
                     )
                 )
     report.navigation = edges
+
+
+def safe_external_target(target: str | None) -> str:
+    value = clean_literal(target)
+    if not value:
+        return "Адрес не определён"
+    match = re.match(r"^(https?)://([^/?#]+)([^?#]*)", value, re.IGNORECASE)
+    if not match:
+        return "Адрес определяется динамически"
+    authority = match.group(2).rsplit("@", 1)[-1]
+    return f"{match.group(1).casefold()}://{authority}{match.group(3)}"
 
 
 def number(value: Any) -> float | None:

@@ -181,6 +181,7 @@ class QueryInfo:
     name: str
     kind: str
     expression_available: bool
+    connection_types: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

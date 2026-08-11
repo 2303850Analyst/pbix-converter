@@ -242,7 +242,7 @@ The field registry is mandatory and appears immediately after `Об отчёте
 Объяснение
 DAX
 Упоминается на листе
-Наименование в источнике
+Наименование поля таблицы в источнике
 Тип данных в источнике
 Используется в DAX
 Используется в визуалах
@@ -268,7 +268,7 @@ The page name and ID are carried by the group heading, so the repeated `Лист
 
 In mixed text every reference contains the explicit entity type, a bold human-readable name in guillemets, and the local ID: `лист «Обзор» (P01)`, `закладка «Исходный вид» (B01)`, or `кнопка «Сбросить представление» (V010)`. A dedicated column may omit the repeated type word but retains the quoted name and ID. Technical references such as `Sales[Region]` remain unquoted. Human-readable model-table, query, role, page, bookmark, and visual names are quoted. The wording remains complete when Confluence strips bold formatting.
 
-Missing visual titles are replaced with a purpose-based label; bookmark rows include the associated page, captured scope, affected elements, and controls that invoke them when those links are available in metadata. Bookmark saved literals are not presented as field values unless metadata provides a reliable field association.
+Missing visual titles and technical hash/UUID titles are replaced everywhere with `Без названия N`, where `N` is derived from the stable document-local visual ID (`V014` -> `Без названия 14`). Bookmark rows include the associated page, captured scope, affected elements, and controls that invoke them when those links are available in metadata. Bookmark saved literals are not presented as field values unless metadata provides a reliable field association.
 
 The comparison taxonomy is fixed:
 
@@ -312,7 +312,7 @@ Supported edge categories include:
 - drillthrough;
 - report-page tooltip;
 - back action when its target is available;
-- web URL as an external target without treating it as a report page.
+- web URL as an external target without treating it as a report page; only scheme, host, port, and path may enter the safe model, while credentials, query parameters, and fragments are removed.
 
 The processor builds a directed navigation graph and derives outgoing and incoming connections for each page. It reports missing bookmark/page targets, bookmarks with no discovered report entry point, links to hidden pages, and navigation cycles as diagnostics. A bookmark without a discovered button is not automatically invalid because it can still be used from the bookmark pane or other Power BI state.
 
@@ -430,7 +430,9 @@ Diagnostics are printed to the console but the internal extraction-diagnostics t
 
 The document starts with the compact report overview; no separate cover page is emitted.
 
-`Состав листа` immediately follows the field registry. Each page has its own heading and an eight-column table: element, name, type/purpose, fields/measures, calculation/DAX, context/filters, related bookmarks, and action/target. Visual filter context is rendered only as scope plus qualified field (`Фильтр листа по полю Table[Field]`); saved literals are centralized in `Все фильтры`. The `Элемент` column contains only the local ID. The following `Переходы и действия (Все закладки)` table is the single navigation register. Bookmark rows document associated pages, entry points, affected elements, saved scope, and user-visible effect. Non-bookmark rows document page, Tooltip, drillthrough, and other navigation targets; bookmark-navigation edges are not duplicated. `Все фильтры` documents report, page, and visual filters with their qualified fields, condition/type, saved values, scope of application, related bookmarks, and extraction status.
+`Состав листа` immediately follows the field registry. Each page has its own heading and an eight-column table: element, name, type/purpose, fields/measures, calculation/DAX, context/filters, related bookmarks, and action/target. Visual filter context is rendered only as scope plus qualified field (`Фильтр листа по полю Table[Field]`); saved literals are centralized in `Все фильтры`. Filter literals are extracted from the semantic condition subtree rather than from the whole visual configuration, and known condition operators are rendered in user-facing language. The `Элемент` column contains only the local ID. The following `Переходы и действия (Все закладки)` table is the single navigation register. Bookmark rows document associated pages, entry points, affected elements, saved scope, and user-visible effect. Non-bookmark rows document page, Tooltip, drillthrough, and other navigation targets; bookmark-navigation edges are not duplicated. `Все фильтры` documents report, page, and visual filters with their qualified fields, condition/type, saved values, scope of application, related bookmarks, and extraction status.
+
+Power Query discovery reads both PBIXRay `power_query` and optional DataMashup `mashup_queries` metadata. The safe model retains only query name, query kind, expression-presence flag, and recognized connector class. Raw M, SQL, server/database identifiers, file paths, credentials, and connection strings are discarded before projection.
 
 The DOCX does not expose the PBIX SHA-256, component/library versions, or the internal value-profile name. Calculation DAX remains available in the field registry and page composition; no separate KPI/calculation catalog is emitted.
 

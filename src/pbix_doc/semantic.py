@@ -222,7 +222,9 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
     statistics_rows = safe_records(model, "statistics", issues)
     calculated_rows = safe_records(model, "dax_columns", issues)
     power_query_rows = safe_records(model, "power_query", issues)
-    native_types = native_query_column_types(power_query_rows)
+    mashup_query_rows = optional_records(model, "mashup_queries", issues)
+    query_rows = deduplicate_query_rows(power_query_rows + mashup_query_rows)
+    native_types = native_query_column_types(query_rows)
 
     schema_index = {
         (str(rget(item, "TableName", "Table")), str(rget(item, "ColumnName", "Name"))): item
@@ -322,12 +324,28 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
             )
         )
 
-    queries: list[QueryInfo] = []
-    for row in power_query_rows:
+    queries_by_name: dict[str, QueryInfo] = {}
+    for row in query_rows:
+        if bool_value(rget(row, "IsParameter")):
+            continue
         name = text_or_none(rget(row, "TableName", "Name"))
         if name:
             expression = text_or_none(rget(row, "Expression"))
-            queries.append(QueryInfo(name, "POWER_QUERY", bool(expression)))
+            connectors = extract_power_query_connection_types(expression or "")
+            existing = queries_by_name.get(name.casefold())
+            if existing:
+                existing.expression_available = existing.expression_available or bool(expression)
+                existing.connection_types = sorted(
+                    set(existing.connection_types) | set(connectors), key=str.casefold
+                )
+            else:
+                queries_by_name[name.casefold()] = QueryInfo(
+                    name,
+                    text_or_none(rget(row, "Kind")) or "POWER_QUERY",
+                    bool(expression),
+                    connectors,
+                )
+    queries = list(queries_by_name.values())
 
     rls: list[SecurityRule] = []
     for row in safe_records(model, "rls", issues):
@@ -355,13 +373,13 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
             )
         )
 
-    connection_types = sorted(
-        {
-            str(item.get("connectionType") or item.get("ConnectionType") or "UNKNOWN")
-            for item in getattr(model, "connections", [])
-            if isinstance(item, dict)
-        }
-    )
+    connection_types = {
+        compact_metadata(rget(item, "connectionType", "ConnectionType", "Type"))
+        for item in records(getattr(model, "connections", []))
+    }
+    connection_types.discard("")
+    for query in queries:
+        connection_types.update(query.connection_types)
     return SemanticModelInfo(
         "EMBEDDED",
         sorted(table_map.values(), key=lambda item: item.name.casefold()),
@@ -370,7 +388,7 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
         queries,
         rls,
         ols,
-        connection_types,
+        sorted(connection_types, key=str.casefold),
         package_version(),
     )
 
@@ -417,6 +435,68 @@ def native_query_column_types(rows: list[dict[str, Any]]) -> dict[tuple[str, str
         for column, values in extract_native_types(expression).items():
             result[(table.casefold(), column.casefold())] = "; ".join(values)
     return result
+
+
+def deduplicate_query_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        name = text_or_none(rget(row, "TableName", "Name")) or ""
+        expression = text_or_none(rget(row, "Expression")) or ""
+        key = (name.casefold(), expression)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(row)
+    return result
+
+
+POWER_QUERY_CONNECTORS = {
+    "sql.database": "SQL Server",
+    "oracle.database": "Oracle",
+    "postgresql.database": "PostgreSQL",
+    "mysql.database": "MySQL",
+    "odbc.datasource": "ODBC",
+    "odbc.query": "ODBC",
+    "oledb.datasource": "OLE DB",
+    "snowflake.databases": "Snowflake",
+    "teradata.database": "Teradata",
+    "analysisservices.database": "Analysis Services",
+    "powerbi.dataflows": "Power BI Dataflows",
+    "powerplatform.dataflows": "Power Platform Dataflows",
+    "commondataservice.database": "Dataverse",
+    "amazonredshift.database": "Amazon Redshift",
+    "amazonathena.databases": "Amazon Athena",
+    "saphana.database": "SAP HANA",
+    "googlebigquery.database": "Google BigQuery",
+    "databricks.catalogs": "Databricks",
+    "sapbusinesswarehouse.cubes": "SAP BW",
+    "sharepoint.files": "SharePoint",
+    "sharepoint.contents": "SharePoint",
+    "azurestorage.blobs": "Azure Blob Storage",
+    "azurestorage.datalake": "Azure Data Lake Storage",
+    "web.contents": "Web",
+    "excel.workbook": "Excel",
+    "csv.document": "CSV",
+    "json.document": "JSON",
+    "folder.files": "Папка",
+    "folder.contents": "Папка",
+    "file.contents": "Файл",
+}
+
+
+def extract_power_query_connection_types(expression: str) -> list[str]:
+    if not expression:
+        return []
+    searchable = _mask_m_strings(_mask_m_comments(expression))
+    functions = {
+        match.group(1).casefold()
+        for match in re.finditer(r"(?<![\w.])([A-Za-z][\w]*(?:\.[A-Za-z][\w]*)+)\s*\(", searchable)
+    }
+    return sorted(
+        {POWER_QUERY_CONNECTORS[name] for name in functions if name in POWER_QUERY_CONNECTORS},
+        key=str.casefold,
+    )
 
 
 def extract_native_types(expression: str) -> dict[str, list[str]]:
@@ -613,6 +693,22 @@ def safe_records(model: Any, property_name: str, issues: list[Issue]) -> list[di
             )
         )
         return []
+
+
+def optional_records(model: Any, property_name: str, issues: list[Issue]) -> list[dict[str, Any]]:
+    try:
+        value = getattr(model, property_name, None)
+    except Exception as error:
+        issues.append(
+            Issue(
+                "WARNING",
+                "MODEL",
+                "MODEL_PROPERTY_UNAVAILABLE",
+                f"{property_name}: {error}",
+            )
+        )
+        return []
+    return records(value)
 
 
 def profile_examples(

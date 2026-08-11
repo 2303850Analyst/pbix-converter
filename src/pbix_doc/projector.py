@@ -30,6 +30,10 @@ OVERFLOW = "<PARTIAL — ЧАСТЬ СВЕДЕНИЙ НЕ ВКЛЮЧЕНА ИЗ-
 DAX_QUALIFIED_REFERENCE_PATTERN = re.compile(
     r"(?:(?:'((?:[^']|'')+)')|([A-Za-z_$][\w$ .-]*))\s*\[([^\]]+)\]"
 )
+TECHNICAL_VISUAL_NAME_PATTERN = re.compile(
+    r"^(?:[0-9a-f]{16,}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -262,8 +266,12 @@ def _field_registry(
                 if _is_excluded_metadata(item.table):
                     continue
                 entry = resolve_entry(item.table, item.name, item.object_type)
-                if clean_text(visual.title):
-                    entry.aliases.add(_entity_name(visual.title, "Элемент без названия"))
+                entry.aliases.add(
+                    _entity_name(
+                        _visual_display_name(visual, visual_ids[(page.id, visual.id)]),
+                        "Элемент без названия",
+                    )
+                )
                 entry.pages.add(page_label)
                 entry.visuals.add(visual_label)
                 if item.aggregation:
@@ -355,7 +363,7 @@ def _field_registry(
                     "Объяснение",
                     "DAX",
                     "Упоминается на листе",
-                    "Наименование в источнике",
+                    "Наименование поля таблицы в источнике",
                     "Тип данных в источнике",
                     "Используется в DAX",
                     "Используется в визуалах",
@@ -407,7 +415,10 @@ def _page_composition(
         ]
         return (
             visual_ids[(page.id, visual.id)],
-            _entity_name(_visual_display_name(visual), "Элемент без названия"),
+            _entity_name(
+                _visual_display_name(visual, visual_ids[(page.id, visual.id)]),
+                "Элемент без названия",
+            ),
             _visual_type_label(visual),
             _visual_sources(visual),
             _visual_calculations(visual, measure_by_key, column_by_key),
@@ -708,7 +719,7 @@ def _page_kind(page: PageInfo) -> str:
 
 def _visual_ref(visual: VisualInfo, local_id: str) -> str:
     return _named_ref(
-        _visual_display_name(visual),
+        _visual_display_name(visual, local_id),
         local_id,
         "Элемент без названия",
         kind=_visual_reference_kind(visual),
@@ -748,14 +759,18 @@ def _bookmark_ref(
     )
 
 
-def _visual_display_name(visual: VisualInfo) -> str:
+def _visual_display_name(visual: VisualInfo, local_id: str) -> str:
     title = clean_text(visual.title)
-    if title and title.casefold() != clean_text(visual.id).casefold():
+    technical_title = title.strip("{} ")
+    if (
+        title
+        and title.casefold() != clean_text(visual.id).casefold()
+        and not TECHNICAL_VISUAL_NAME_PATTERN.fullmatch(technical_title)
+    ):
         return title
-    label = _visual_type_label(visual).split(";", 1)[0]
-    if label in {"Кнопка навигации", "Навигатор закладок", "Навигатор листов"}:
-        return label
-    return f"{label} без заголовка"
+    match = re.search(r"(\d+)$", clean_text(local_id))
+    number = str(int(match.group(1))) if match else clean_text(local_id) or "?"
+    return f"Без названия {number}"
 
 
 def _bookmark_display_name(bookmark: BookmarkInfo) -> str:
@@ -1067,14 +1082,15 @@ def _semantic_model(model: DocumentationModel) -> list[DocumentBlock]:
             [
                 HeadingBlock(2, "Связи"),
                 TableBlock(
-                    ("Из", "В", "Кардинальность", "Фильтрация", "Статус"),
+                    ("Из", "В", "Кардинальность", "Фильтрация", "Статус / RLS"),
                     [
                         (
                             clean_text(item.from_object),
                             clean_text(item.to_object),
                             clean_text(item.cardinality or "—"),
-                            clean_text(item.filter_direction or "—"),
-                            f"Активна: {yes_no(item.active)}; security: {clean_text(item.security_filter or '—')}",
+                            _cross_filter_label(item.filter_direction),
+                            f"Активна: {yes_no(item.active)}; передача RLS: "
+                            f"{_security_filter_label(item.security_filter)}",
                         )
                         for item in relationships[:MAX_TABLE_ROWS]
                     ],
@@ -1095,27 +1111,47 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
     if queries:
         blocks.append(
             TableBlock(
-                ("Запрос", "Тип", "Выражение"),
+                ("Запрос", "Тип", "Подключение", "M-код"),
                 [
                     (
                         f"запрос {_entity_name(item.name, 'Запрос без названия')}",
-                        clean_text(item.kind),
-                        "Определено; текст не выводится" if item.expression_available else "—",
+                        _query_kind_label(item.kind),
+                        ", ".join(item.connection_types) or "—",
+                        "Найден; текст не выводится" if item.expression_available else "—",
                     )
                     for item in queries[:MAX_TABLE_ROWS]
                 ],
-                (3_100, 2_200, 4_060),
+                (2_500, 1_700, 2_200, 2_960),
             )
         )
+        assigned_connections = {
+            connection
+            for query in queries
+            for connection in query.connection_types
+        }
+        unassigned_connections = [
+            value
+            for value in semantic.connection_types
+            if value not in assigned_connections
+        ]
+        if unassigned_connections:
+            blocks.append(
+                ParagraphBlock(
+                    "Подключения модели без однозначной привязки к запросу: "
+                    + ", ".join(clean_text(value) for value in unassigned_connections),
+                    "note",
+                )
+            )
     else:
         blocks.append(ParagraphBlock("Метаданные Power Query не найдены или недоступны."))
-    blocks.append(
-        ParagraphBlock(
-            "Типы подключений: "
-            + (", ".join(clean_text(value) for value in semantic.connection_types) or "не определены"),
-            "note",
+    if not queries:
+        blocks.append(
+            ParagraphBlock(
+                "Типы подключений: "
+                + (", ".join(clean_text(value) for value in semantic.connection_types) or "не определены"),
+                "note",
+            )
         )
-    )
     blocks.append(HeadingBlock(2, "RLS и OLS"))
     if rls:
         rows: list[tuple[str, ...]] = []
@@ -1506,8 +1542,22 @@ def _filter_scope_label(value: str) -> str:
 
 def _filter_type_label(value: str) -> str:
     labels = {
-        "categorical": "Категориальный",
-        "advanced": "Расширенный",
+        "in": "Выбраны значения",
+        "not in": "Исключены значения",
+        "between": "Диапазон",
+        "contains": "Содержит",
+        "not contains": "Не содержит",
+        "starts with": "Начинается с",
+        "ends with": "Заканчивается на",
+        "greater than": "Больше",
+        "greater than or equal": "Больше или равно",
+        "less than": "Меньше",
+        "less than or equal": "Меньше или равно",
+        "equals": "Равно",
+        "not equals": "Не равно",
+        "top n": "Первые N",
+        "categorical": "Выбраны значения",
+        "advanced": "Условие",
         "relative": "Относительный",
         "relative date": "Относительная дата",
         "topn": "Первые N",
@@ -1516,6 +1566,51 @@ def _filter_type_label(value: str) -> str:
     }
     normalized = clean_text(value).replace("_", " ")
     return labels.get(normalized.casefold(), normalized or "—")
+
+
+def _security_filter_label(value: str | None) -> str:
+    raw = clean_text(value).casefold()
+    codes = {
+        "1": "по направлению связи",
+        "2": "в обе стороны",
+        "3": "не передаётся",
+    }
+    if raw in codes:
+        return codes[raw]
+    normalized = re.sub(r"[^a-z]", "", raw)
+    labels = {
+        "bothdirections": "в обе стороны",
+        "onedirection": "по направлению связи",
+        "none": "не передаётся",
+        "true": "включена",
+        "false": "не передаётся",
+    }
+    return labels.get(normalized, _display_or_dash(value))
+
+
+def _query_kind_label(value: str | None) -> str:
+    normalized = clean_text(value).replace("_", " ").casefold()
+    return {
+        "power query": "Power Query",
+        "query": "Power Query",
+        "function": "Функция Power Query",
+    }.get(normalized, _display_or_dash(value))
+
+
+def _cross_filter_label(value: str | None) -> str:
+    raw = clean_text(value).casefold()
+    labels = {
+        "1": "Односторонняя",
+        "2": "Двусторонняя",
+        "3": "Автоматическая",
+        "single": "Односторонняя",
+        "onedirection": "Односторонняя",
+        "both": "Двусторонняя",
+        "bothdirections": "Двусторонняя",
+        "automatic": "Автоматическая",
+    }
+    normalized = re.sub(r"[^a-z]", "", raw)
+    return labels.get(raw, labels.get(normalized, _display_or_dash(value)))
 
 
 def _issue_summary(model: DocumentationModel) -> str:
@@ -1619,7 +1714,7 @@ def _example_status_label(value: str | None) -> str:
         "NOT_PROFILED": "Не проверялось",
         "PROFILE_FAILED": "Не удалось получить",
         "IDENTIFIER_OR_HIDDEN": "Служебное или скрытое поле",
-        "HIGH_OR_UNKNOWN_CARDINALITY": "Много значений",
+        "HIGH_OR_UNKNOWN_CARDINALITY": "Нет примеров: >200 значений или число неизвестно",
         "DATE_VALUES_HIDDEN": "Дата; примеры не выводятся",
         "NUMERIC_VALUES_HIDDEN": "Числовое поле; примеры не выводятся",
     }
