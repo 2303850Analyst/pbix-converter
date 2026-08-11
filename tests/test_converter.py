@@ -533,13 +533,17 @@ class RendererTests(unittest.TestCase):
             payload = render_document(project_document(model))
             text = read_docx_text(payload)
 
-        self.assertIn("Кнопки и переходы", text)
-        self.assertIn("Все закладки", text)
+        self.assertIn("Переходы и действия (Все закладки)", text)
+        self.assertNotIn("Кнопки и переходы", text)
         self.assertIn("Все фильтры", text)
-        self.assertIn("Пользовательские маршруты", text)
+        self.assertNotIn("Пользовательские маршруты", text)
+        self.assertNotIn("Путеводитель по листам и визуалам", text)
+        self.assertNotIn("POWER BI · ТЕХНИЧЕСКОЕ РУКОВОДСТВО", text)
         self.assertIn("Одинаковое название — возможные различия", text)
         self.assertIn("РАЗЛИЧИЕ ОПРЕДЕЛЕНИЙ", text)
-        self.assertIn("Каталог KPI и вычислений", text)
+        self.assertNotIn("Каталог KPI и вычислений", text)
+        self.assertNotIn("Определение DAX", text)
+        self.assertNotIn("Где используется и какой контекст обнаружен", text)
         self.assertIn("Реестр полей отчёта", text)
         self.assertIn("Состав листа", text)
         self.assertIn("Варианты названий", text)
@@ -574,19 +578,34 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn("V001 ·", text)
         self.assertNotIn("B01 ·", text)
         self.assertNotIn("K001 ·", text)
+        self.assertNotIn("SHA-256", text)
+        self.assertNotIn("Версия генератора", text)
+        self.assertNotIn("Версия PBIXRay", text)
+        self.assertNotIn("Профиль значений", text)
         self.assertNotIn("**", text)
         self.assertIn("лист «Обзор» (P01)", text)
         self.assertIn("закладка «Исходный вид» (B01)", text)
         self.assertIn("таблица «Sales»", text)
-        self.assertIn("Ось Y / значение", text)
         self.assertNotIn(str(path.resolve()), text)
         self.assertIn("Источник", text)
         self.assertIn('Sales[Region] = "<VALUE>"', text)
         self.assertNotIn('"North"', text)
         self.assertEqual(sum(value in text for value in ["Центр", "Север", "Юг", "Запад", "Восток"]), 5)
         document = Document(BytesIO(payload))
+        self.assertEqual(next(paragraph.text for paragraph in document.paragraphs if paragraph.text), "Об отчёте")
+        headings = {
+            paragraph.text
+            for paragraph in document.paragraphs
+            if paragraph.style.name.startswith("Heading")
+        }
+        self.assertNotIn("Статус извлечения", headings)
+        self.assertNotIn("Как читать документ", headings)
+        self.assertNotIn("Карта листов", headings)
+        self.assertNotIn("Фильтры уровня отчёта", headings)
         table_headers = [tuple(cell.text for cell in table.rows[0].cells) for table in document.tables]
-        filter_index = next(index for index, row in enumerate(table_headers) if row[0] == "Область")
+        overview_index = next(
+            index for index, row in enumerate(table_headers) if row == ("Параметр", "Значение")
+        )
         registry_index = next(index for index, row in enumerate(table_headers) if row[0] == "Таблица[Поле]")
         composition_indexes = [
             index
@@ -594,8 +613,10 @@ class RendererTests(unittest.TestCase):
             if row[:2] == ("Элемент", "Название")
         ]
         composition_index = composition_indexes[0]
-        bookmarks_index = next(
-            index for index, row in enumerate(table_headers) if row[:2] == ("Закладка", "Группа")
+        navigation_index = next(
+            index
+            for index, row in enumerate(table_headers)
+            if row[:2] == ("Элемент / закладка", "Тип действия")
         )
         filters_index = next(
             index
@@ -605,7 +626,7 @@ class RendererTests(unittest.TestCase):
         registry = document.tables[registry_index]
         compositions = [document.tables[index] for index in composition_indexes]
         registry_rows = {row.cells[0].text: row for row in registry.rows[1:]}
-        self.assertEqual(registry_index, filter_index + 1)
+        self.assertEqual(registry_index, overview_index + 1)
         self.assertEqual(composition_index, registry_index + 1)
         self.assertEqual(len(registry.columns), 11)
         self.assertEqual(
@@ -637,8 +658,8 @@ class RendererTests(unittest.TestCase):
                 "Действие / переход",
             ),
         )
-        self.assertEqual(bookmarks_index, composition_indexes[-1] + 1)
-        self.assertEqual(filters_index, bookmarks_index + 1)
+        self.assertEqual(navigation_index, composition_indexes[-1] + 1)
+        self.assertEqual(filters_index, navigation_index + 1)
         composition_rows = {
             row.cells[0].text: row
             for table in compositions
@@ -659,11 +680,14 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn("Пусто", composition_rows["V001"].cells[5].text)
         self.assertNotIn("Да", composition_rows["V001"].cells[5].text)
         self.assertNotIn("Категориальный", composition_rows["V001"].cells[5].text)
-        bookmark_rows = {
-            row.cells[0].text: row for row in document.tables[bookmarks_index].rows[1:]
+        navigation_rows = {
+            row.cells[0].text: row for row in document.tables[navigation_index].rows[1:]
         }
-        self.assertIn("«Исходный вид» (B01)", bookmark_rows)
-        self.assertIn("лист «Обзор» (P01)", bookmark_rows["«Исходный вид» (B01)"].cells[4].text)
+        self.assertIn("«Исходный вид» (B01)", navigation_rows)
+        self.assertIn("лист «Обзор» (P01)", navigation_rows["«Исходный вид» (B01)"].cells[4].text)
+        navigation_types = {row.cells[1].text for row in document.tables[navigation_index].rows[1:]}
+        self.assertTrue(any(value.startswith("Закладка") for value in navigation_types))
+        self.assertIn("Переход на лист", navigation_types)
         filter_rows = document.tables[filters_index].rows[1:]
         self.assertTrue(any(row.cells[2].text == "Sales[Region]" for row in filter_rows))
         self.assertTrue(any("Секретный регион" in row.cells[4].text for row in filter_rows))

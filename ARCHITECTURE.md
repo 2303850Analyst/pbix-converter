@@ -71,9 +71,9 @@ CLI / Controller
     -> Atomic Writer
 ```
 
-`DocumentProjector` receives the normalized and policy-safe domain model and derives the field registry, page-grouped composition, bookmark and filter registers, user-facing KPI lineage, same-name comparison groups, explicit context evidence, navigation indexes, and document-local references. The DOCX renderer receives only `SafeDocumentModel`. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, the normalized PBIX model, or unsanitized values.
+`DocumentProjector` receives the normalized and policy-safe domain model and derives the field registry, page-grouped composition, unified bookmark/navigation and filter registers, same-name comparison groups, explicit context evidence, and document-local references. The DOCX renderer receives only `SafeDocumentModel`. It must not access raw PBIX members, raw report JSON, DataFrames containing table rows, the normalized PBIX model, or unsanitized values.
 
-Immediately after the report-level filters, the projector emits a single field registry. It combines every locally discovered semantic column, measure, calculated column, report field reference, filter reference, visual usage, aggregation, and DAX dependency. NativeQuery is never executed or copied into the safe document model: the semantic adapter retains only normalized source-column names and data-type declarations extracted from model metadata, SQL `CAST`/`CONVERT`, or Power Query type steps.
+Immediately after the compact report overview, the projector emits a single field registry. It combines every locally discovered semantic column, measure, calculated column, report field reference, filter reference, visual usage, aggregation, and DAX dependency. NativeQuery is never executed or copied into the safe document model: the semantic adapter retains only normalized source-column names and data-type declarations extracted from model metadata, SQL `CAST`/`CONVERT`, or Power Query type steps.
 
 ## 3. Input handling
 
@@ -225,8 +225,7 @@ Each normalized semantic column may additionally retain `format_string`, `source
 
 `DocumentProjector` is a deterministic interpretation boundary. It may derive only facts supported by normalized metadata and produces:
 
-- short stable document-local IDs for pages, visuals, KPI definitions, bookmarks, and navigation edges;
-- symbolic KPI dependency chains without evaluating DAX;
+- short stable document-local IDs for pages, visuals, bookmarks, and navigation edges;
 - usage locations and explicit report/page/visual/bookmark context evidence;
 - page-grouped composition tables for visuals, controls, and bookmarks;
 - complete bookmark and filter registers;
@@ -234,7 +233,7 @@ Each normalized semantic column may additionally retain `format_string`, `source
 - incoming and outgoing navigation indexes and direct user journeys;
 - `PARTIAL`, `UNRESOLVED`, and overflow markers.
 
-The field registry is mandatory and appears immediately after `Фильтры уровня отчёта`. Its columns are fixed:
+The field registry is mandatory and appears immediately after `Об отчёте`. Its columns are fixed:
 
 ```text
 Таблица[Поле]
@@ -265,9 +264,9 @@ Immediately after the field registry, the projector emits `Состав лист
 Действие / переход
 ```
 
-The page name and ID are carried by the group heading, so the repeated `Лист` column is omitted. The `Элемент` cell is the sole place where a bare local ID is sufficient. The composition groups are followed by the complete `Все закладки` and `Все фильтры` registers.
+The page name and ID are carried by the group heading, so the repeated `Лист` column is omitted. The `Элемент` cell is the sole place where a bare local ID is sufficient. The composition groups are followed by the unified `Переходы и действия (Все закладки)` register and the complete `Все фильтры` register.
 
-In mixed text every reference contains the explicit entity type, a bold human-readable name in guillemets, and the local ID: `лист «Обзор» (P01)`, `закладка «Исходный вид» (B01)`, `кнопка «Сбросить представление» (V010)`, or `вычисление «Выручка» (K001)`. A dedicated column may omit the repeated type word but retains the quoted name and ID. Technical references such as `Sales[Region]` remain unquoted. Human-readable model-table, query, role, page, bookmark, visual, and calculation names are quoted. The wording remains complete when Confluence strips bold formatting.
+In mixed text every reference contains the explicit entity type, a bold human-readable name in guillemets, and the local ID: `лист «Обзор» (P01)`, `закладка «Исходный вид» (B01)`, or `кнопка «Сбросить представление» (V010)`. A dedicated column may omit the repeated type word but retains the quoted name and ID. Technical references such as `Sales[Region]` remain unquoted. Human-readable model-table, query, role, page, bookmark, and visual names are quoted. The wording remains complete when Confluence strips bold formatting.
 
 Missing visual titles are replaced with a purpose-based label; bookmark rows include the associated page, captured scope, affected elements, and controls that invoke them when those links are available in metadata. Bookmark saved literals are not presented as field values unless metadata provides a reliable field association.
 
@@ -418,29 +417,28 @@ Diagnostics are printed to the console but the internal extraction-diagnostics t
 ## 13. DOCX output contract
 
 ```text
-1. Report passport, extraction status, and terminology
-2. Report-level filters
-3. Complete field registry
-4. Page composition grouped by page
-5. Complete bookmark register
-6. Complete filter register
-7. Same visible name — possible structural or context differences
-8. KPI and calculation catalog
-9. Page and visual guide
-10. Buttons, navigators, tooltip, and drillthrough
-11. Direct user journeys
-12. Semantic model and relationships
-13. Power Query and sources
-14. RLS and OLS
+1. Compact report overview and extraction completeness
+2. Complete field registry
+3. Page composition grouped by page
+4. Unified bookmark, action, and navigation register
+5. Complete filter register, including report-level filters
+6. Same visible name — possible structural or context differences
+7. Semantic model and relationships
+8. Power Query and sources
+9. RLS and OLS
 ```
 
-`Состав листа` immediately follows the field registry. Each page has its own heading and an eight-column table: element, name, type/purpose, fields/measures, calculation/DAX, context/filters, related bookmarks, and action/target. Visual filter context is rendered only as scope plus qualified field (`Фильтр листа по полю Table[Field]`); saved literals are centralized in `Все фильтры`. The `Элемент` column contains only the local ID. The following `Все закладки` table documents bookmark group, associated page, entry points, target, affected elements, saved scope, and user-visible effect. `Все фильтры` documents report, page, and visual filters with their qualified fields, condition/type, saved values, scope of application, related bookmarks, and extraction status.
+The document starts with the compact report overview; no separate cover page is emitted.
+
+`Состав листа` immediately follows the field registry. Each page has its own heading and an eight-column table: element, name, type/purpose, fields/measures, calculation/DAX, context/filters, related bookmarks, and action/target. Visual filter context is rendered only as scope plus qualified field (`Фильтр листа по полю Table[Field]`); saved literals are centralized in `Все фильтры`. The `Элемент` column contains only the local ID. The following `Переходы и действия (Все закладки)` table is the single navigation register. Bookmark rows document associated pages, entry points, affected elements, saved scope, and user-visible effect. Non-bookmark rows document page, Tooltip, drillthrough, and other navigation targets; bookmark-navigation edges are not duplicated. `Все фильтры` documents report, page, and visual filters with their qualified fields, condition/type, saved values, scope of application, related bookmarks, and extraction status.
+
+The DOCX does not expose the PBIX SHA-256, component/library versions, or the internal value-profile name. Calculation DAX remains available in the field registry and page composition; no separate KPI/calculation catalog is emitted.
 
 The DOCX uses the `compact_reference_guide` design preset with an Arial 10 pt body, built-in `Heading 1`–`Heading 3`, a monospaced code style for DAX, and native Word tables. All sections use A4 landscape orientation, narrow margins, compact paragraph spacing, and reduced cell padding. Ordinary tables expand to the available landscape width; the field registry remains an 11-column compact table and page composition uses eight columns. All tables have explicit fixed geometry, repeated header rows, and no merged or nested cells. Registry and page-composition rows may continue across pages when their sanitized DAX is long. Color is never the sole carrier of meaning. Critical navigation does not depend on Word hyperlinks surviving Confluence import.
 
 The package is macro-free OOXML. Before publication, `OOXMLValidator` rejects macros, OLE/ActiveX or embedded objects, remote templates, external relationships, external hyperlinks, automatic fields, unsafe member paths, duplicate members, invalid XML, disallowed control characters, and package or part size violations. The writer uses a same-directory temporary file, validates it, fsyncs it, and performs atomic replacement where the filesystem supports it.
 
-The file-information section contains the PBIX filename, size, modification time, and SHA-256. It does not contain the absolute input path.
+The report overview contains the PBIX filename, report format, generation time, extraction completeness, object counts, resolved-field count, and semantic-model availability. It does not contain the absolute input path, file hash, component versions, or internal policy names.
 
 The DOCX is intended for manual import through the built-in Word import in Atlassian Confluence Data Center. Exact fonts, widths, page breaks, and internal Word navigation may be restyled by Confluence; the heading hierarchy, visible document-local IDs, native tables, and explicit textual destinations are the durable contract.
 

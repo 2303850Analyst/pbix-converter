@@ -11,14 +11,12 @@ from docx import Document
 from docx.document import Document as DocumentObject
 from docx.enum.section import WD_ORIENT, WD_SECTION
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 from .ooxml import validate_docx
 from .projector import (
-    CodeBlock,
     HeadingBlock,
     ListBlock,
     ParagraphBlock,
@@ -36,7 +34,6 @@ BLUE = "2E5E8C"
 DARK_BLUE = "17365D"
 LIGHT_BLUE = "E8EEF5"
 LIGHT_GRAY = "F2F4F7"
-MUTED = "5F6B76"
 RED = "9B1C1C"
 GOLD = "7A5A00"
 
@@ -44,7 +41,9 @@ GOLD = "7A5A00"
 def render_document(model: SafeDocumentModel) -> bytes:
     document = Document()
     _configure_document(document)
-    _add_cover(document, model)
+    generated = model.generated_at.replace(tzinfo=None)
+    document.core_properties.created = generated
+    document.core_properties.modified = generated
     for block in model.blocks:
         if isinstance(block, HeadingBlock):
             _add_heading(document, block)
@@ -54,8 +53,6 @@ def render_document(model: SafeDocumentModel) -> bytes:
             _add_list(document, block)
         elif isinstance(block, TableBlock):
             _add_table(document, block)
-        elif isinstance(block, CodeBlock):
-            _add_code(document, block)
         elif isinstance(block, SectionBreakBlock):
             _add_section_break(document, block)
     stream = BytesIO()
@@ -127,52 +124,6 @@ def _configure_document(document: DocumentObject) -> None:
     document.core_properties.author = "PBIX Converter"
     document.core_properties.last_modified_by = "PBIX Converter"
     document.core_properties.comments = "Generated locally; no external relationships"
-
-
-def _add_cover(document: DocumentObject, model: SafeDocumentModel) -> None:
-    generated = model.generated_at.replace(tzinfo=None)
-    document.core_properties.created = generated
-    document.core_properties.modified = generated
-    spacer = document.add_paragraph()
-    spacer.paragraph_format.space_after = Pt(12)
-
-    kicker = document.add_paragraph()
-    kicker.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    kicker.paragraph_format.space_after = Pt(5)
-    run = kicker.add_run("POWER BI · ТЕХНИЧЕСКОЕ РУКОВОДСТВО")
-    _set_run_font(run, "Arial", 9, BLUE, bold=True)
-
-    title = document.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title.paragraph_format.space_after = Pt(8)
-    run = title.add_run(clean_text(model.title))
-    _set_run_font(run, "Arial", 22, DARK_BLUE, bold=True)
-
-    subtitle = document.add_paragraph()
-    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    subtitle.paragraph_format.space_after = Pt(10)
-    run = subtitle.add_run(clean_text(model.subtitle))
-    _set_run_font(run, "Arial", 11, MUTED)
-
-    cover_table = TableBlock(
-        ("Параметр", "Значение"),
-        [
-            ("Исходный файл", model.source_name),
-            ("Статус", model.overall_status),
-            ("Сформирован", model.generated_at.isoformat()),
-            ("Режим", "Локальная обработка в защищённой среде VDI"),
-            ("Назначение", "Ручной импорт DOCX в Atlassian Confluence Data Center"),
-        ],
-        (2_300, 7_060),
-    )
-    _add_table(document, cover_table)
-    note = document.add_paragraph()
-    note.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    note.paragraph_format.space_before = Pt(6)
-    run = note.add_run("Детальные строки данных не включаются; сохранённые значения фильтров берутся только из метаданных отчёта.")
-    _set_run_font(run, "Arial", 8.5, MUTED, italic=True)
-
-    document.add_section(WD_SECTION.NEW_PAGE)
 
 
 def _canonicalize_package(payload: bytes) -> bytes:
@@ -293,21 +244,6 @@ def _add_table(document: DocumentObject, block: TableBlock) -> None:
             _prevent_row_split(row)
     after = document.add_paragraph()
     after.paragraph_format.space_after = Pt(0)
-
-
-def _add_code(document: DocumentObject, block: CodeBlock) -> None:
-    paragraph = document.add_paragraph()
-    paragraph.paragraph_format.left_indent = Inches(0.12)
-    paragraph.paragraph_format.right_indent = Inches(0.12)
-    paragraph.paragraph_format.space_before = Pt(2)
-    paragraph.paragraph_format.space_after = Pt(3)
-    paragraph.paragraph_format.line_spacing = 1.0
-    _shade_paragraph(paragraph, LIGHT_GRAY)
-    run = paragraph.add_run(clean_text(block.text, preserve_newlines=True, limit=12_000))
-    _set_run_font(run, "Consolas", 8.5, "202124")
-    if block.status != "OK":
-        status = paragraph.add_run(f"\n[{clean_text(block.status)}]")
-        _set_run_font(status, "Arial", 8.5, GOLD, bold=True)
 
 
 def _set_cell_text(
