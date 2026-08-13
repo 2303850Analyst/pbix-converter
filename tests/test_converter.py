@@ -43,7 +43,6 @@ from pbix_doc.pipeline import Options, generate_documentation, resolve_fields
 from pbix_doc.policy import METADATA_EXCLUSION_POLICY
 from pbix_doc.ooxml import UnsafeDocxError, validate_docx
 from pbix_doc.projector import (
-    CodeBlock,
     HeadingBlock,
     SafeDocumentModel,
     TableBlock,
@@ -622,7 +621,7 @@ class RendererTests(unittest.TestCase):
         self.assertIn("<СЛУЖЕБНАЯ ССЫЛКА>", text)
         self.assertIn("Сервер / база / путь", text)
         self.assertIn("Строка подключения", text)
-        self.assertIn("M-код: запрос «Sales Import»", text)
+        self.assertIn("M-код:", text)
         self.assertIn('Sql.Database("srv01", "DWH")', text)
         self.assertIn("SELECT amount FROM dbo.sales", text)
         self.assertIn("Password=<СКРЫТО>", text)
@@ -685,6 +684,18 @@ class RendererTests(unittest.TestCase):
             if row[:2] == ("Область", "Источник фильтра")
         )
         registry = document.tables[registry_index]
+        power_query_index = next(
+            index
+            for index, row in enumerate(table_headers)
+            if row[:2] == ("Запрос", "Тип")
+        )
+        power_query_row = document.tables[power_query_index].rows[1]
+        self.assertIn(
+            "Server=srv01;Database=DWH;Password=<СКРЫТО>",
+            power_query_row.cells[4].text,
+        )
+        self.assertIn("M-код:\nlet Source = Sql.Database", power_query_row.cells[4].text)
+        self.assertFalse(any(value.startswith("M-код: запрос") for value in headings))
         compositions = [document.tables[index] for index in composition_indexes]
         registry_rows = {row.cells[0].text: row for row in registry.rows[1:]}
         self.assertEqual(registry_index, overview_index + 1)
@@ -804,6 +815,30 @@ class RendererTests(unittest.TestCase):
         for excluded in (b"LocalDateTable", b"DateTableTemplate", b"H$", b"R$", b"U$"):
             self.assertNotIn(excluded, document_xml)
 
+    def test_technical_visual_titles_are_not_compared_as_visible_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "fixture.pbix")
+            write_zip(path, pbir_parts())
+            issues = []
+            with PbixContainer(path) as container:
+                report = parse_report(container, path.stem, issues)
+            technical_title = "025648240810569ac1d1"
+            report.pages[0].visuals[0].title = technical_title
+            report.pages[1].visuals[0].title = technical_title
+            model = DocumentationModel(
+                FileInfo(path, path.stat().st_size, "0" * 64, datetime.now(timezone.utc)),
+                report,
+                SemanticModelInfo("NO_MODEL"),
+                issues,
+                datetime.now(timezone.utc),
+                "test",
+            )
+
+            text = read_docx_text(render_document(project_document(model)))
+
+        self.assertNotIn(technical_title, text)
+        self.assertNotIn(f"Показатель «{technical_title}»", text)
+
     def test_atomic_writer_publishes_valid_docx(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "fixture.pbix")
@@ -865,7 +900,7 @@ class RendererTests(unittest.TestCase):
 
     def test_table_renderer_does_not_silently_truncate_projected_text(self) -> None:
         generated = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
-        long_text = "DAX:" + "X" * 6_000
+        long_text = "M/DAX:" + "X" * 13_000
         model = SafeDocumentModel(
             "Отчёт",
             "Описание",
@@ -873,20 +908,6 @@ class RendererTests(unittest.TestCase):
             generated,
             "OK",
             [TableBlock(("Выражение DAX",), [(long_text,)], (9_360,))],
-        )
-
-        self.assertIn(long_text, read_docx_text(render_document(model)))
-
-    def test_code_renderer_does_not_truncate_power_query(self) -> None:
-        generated = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
-        long_text = "let Source = \"" + "X" * 13_000 + "\" in Source_END"
-        model = SafeDocumentModel(
-            "Отчёт",
-            "Описание",
-            "fixture.pbix",
-            generated,
-            "OK",
-            [CodeBlock(long_text)],
         )
 
         self.assertIn(long_text, read_docx_text(render_document(model)))
@@ -1187,7 +1208,7 @@ class SemanticAdapterTests(unittest.TestCase):
         self.assertEqual(column.data_type, "Decimal")
         self.assertEqual(column.format_string, "#,0.00")
         self.assertEqual(column.source_column, "amount_net")
-        self.assertEqual(column.native_data_type, "SQL: decimal(18,2); M: Currency.Type")
+        self.assertEqual(column.native_data_type, "M: Currency.Type")
         self.assertEqual(column.summarize_by, "SUM")
         self.assertEqual(semantic.queries[0].connection_types, ["SQL Server"])
         self.assertEqual(semantic.connection_types, ["SQL Server"])
@@ -1211,7 +1232,38 @@ class SemanticAdapterTests(unittest.TestCase):
 
         self.assertEqual(
             extract_native_types(expression),
-            {"amount_net": ["SQL: decimal(18,2)", "M: Currency.Type"]},
+            {"amount_net": ["M: Currency.Type"]},
+        )
+        self.assertEqual(
+            extract_native_types(
+                'Value.NativeQuery(Db, "SELECT CAST(amount AS decimal(18,2)) AS amount_net")'
+            ),
+            {"amount_net": ["SQL: decimal(18,2)"]},
+        )
+        self.assertEqual(
+            extract_native_types(
+                'Sql.Database("server", "database", '
+                '[Query="SELECT CONVERT(bigint, customer_id) AS customer_key"])'
+            ),
+            {"customer_key": ["SQL: bigint"]},
+        )
+
+    def test_last_power_query_type_wins_and_follows_renames(self) -> None:
+        expression = (
+            'let Source = Table.TransformColumnTypes(Input,{{"old_name", type text}}), '
+            'Renamed = Table.RenameColumns(Source,{{"old_name", "new_name"}}), '
+            'Converted = Table.TransformColumns(Renamed,{{"new_name", Text.Length, Int64.Type}}), '
+            'Added = Table.AddColumn(Converted, "added", each 1, type number), '
+            'Typed = Value.ReplaceType(Added, type table [new_name = type nullable text, '
+            '#"added" = Int64.Type]) in Typed'
+        )
+
+        self.assertEqual(
+            extract_native_types(expression),
+            {
+                "new_name": ["M: type nullable text"],
+                "added": ["M: Int64.Type"],
+            },
         )
 
     def test_power_query_connectors_are_detected_without_source_arguments(self) -> None:

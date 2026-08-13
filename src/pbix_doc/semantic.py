@@ -667,7 +667,14 @@ def first_named_scalar(node: Any, names: tuple[str, ...]) -> str | None:
 
 
 def extract_native_types(expression: str) -> dict[str, list[str]]:
-    found: dict[str, list[str]] = defaultdict(list)
+    events: list[tuple[int, int, str, str, str | None]] = []
+    sequence = 0
+
+    def add_event(position: int, action: str, name: str, value: str | None = None) -> None:
+        nonlocal sequence
+        events.append((position, sequence, action, compact_metadata(name), value))
+        sequence += 1
+
     cast_pattern = re.compile(
         r"\bCAST\s*\(.*?\bAS\s+"
         r"([A-Za-z][A-Za-z0-9_ ]*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)\s*\)\s+AS\s+"
@@ -681,33 +688,256 @@ def extract_native_types(expression: str) -> dict[str, list[str]]:
         re.IGNORECASE | re.DOTALL,
     )
     uncommented = _mask_m_comments(expression)
-    for arguments in _function_call_arguments(uncommented, "Value.NativeQuery"):
-        if len(arguments) < 2:
-            continue
-        sql_text = _decode_m_string(arguments[1])
-        if sql_text is None:
-            continue
+    native_sql: list[tuple[int, str]] = []
+    for function_name, argument_index in (
+        ("Value.NativeQuery", 1),
+        ("Odbc.Query", 1),
+    ):
+        for position, arguments in _located_function_call_arguments(
+            uncommented, function_name
+        ):
+            if len(arguments) <= argument_index:
+                continue
+            sql_text = _decode_m_string(arguments[argument_index])
+            if sql_text is not None:
+                native_sql.append((position, sql_text))
+    native_sql.extend(_m_named_string_values(uncommented, ("Query", "SQLStatement")))
+
+    for position, sql_text in sorted(native_sql):
         for pattern in (cast_pattern, convert_pattern):
             for match in pattern.finditer(sql_text):
                 data_type = compact_metadata(match.group(1))
                 alias = next((value for value in match.groups()[1:] if value), None)
                 if alias and data_type:
-                    _append_unique(found[compact_metadata(alias)], f"SQL: {data_type}")
+                    add_event(position, "TYPE", alias, f"SQL: {data_type}")
 
-    m_type_pattern = re.compile(
-        r'\{\s*"((?:[^\"]|\"\")+)"\s*,\s*'
-        r'((?:type\s+(?:nullable\s+)?)?[A-Za-z_][A-Za-z0-9_.]*)\s*\}',
-        re.IGNORECASE,
-    )
-    for arguments in _function_call_arguments(uncommented, "Table.TransformColumnTypes"):
+    for position, arguments in _located_function_call_arguments(
+        uncommented, "Table.TransformColumnTypes"
+    ):
         if len(arguments) < 2:
             continue
-        for match in m_type_pattern.finditer(arguments[1]):
-            column = compact_metadata(match.group(1).replace('""', '"'))
-            data_type = compact_metadata(match.group(2))
+        for row in _m_list_rows(arguments[1]):
+            if len(row) < 2:
+                continue
+            column = _decode_m_string(row[0])
+            data_type = _m_type_expression(row[1])
             if column and data_type:
-                _append_unique(found[column], f"M: {data_type}")
-    return dict(found)
+                add_event(position, "TYPE", column, f"M: {data_type}")
+
+    for position, arguments in _located_function_call_arguments(
+        uncommented, "Table.TransformColumns"
+    ):
+        if len(arguments) < 2:
+            continue
+        for row in _m_list_rows(arguments[1]):
+            if len(row) < 3:
+                continue
+            column = _decode_m_string(row[0])
+            data_type = _m_type_expression(row[-1])
+            if column and data_type:
+                add_event(position, "TYPE", column, f"M: {data_type}")
+
+    for position, arguments in _located_function_call_arguments(
+        uncommented, "Table.AddColumn"
+    ):
+        if len(arguments) < 4:
+            continue
+        column = _decode_m_string(arguments[1])
+        data_type = _m_type_expression(arguments[3])
+        if column and data_type:
+            add_event(position, "TYPE", column, f"M: {data_type}")
+
+    for position, assignments in _m_table_type_assignments(uncommented):
+        for column, data_type in assignments:
+            add_event(position, "TYPE", column, f"M: {data_type}")
+
+    for position, arguments in _located_function_call_arguments(
+        uncommented, "Table.RenameColumns"
+    ):
+        if len(arguments) < 2:
+            continue
+        for row in _m_list_rows(arguments[1]):
+            if len(row) < 2:
+                continue
+            source = _decode_m_string(row[0])
+            target = _decode_m_string(row[1])
+            if source and target:
+                add_event(position, "RENAME", source, target)
+
+    found: dict[str, tuple[str, str]] = {}
+    for _, _, action, name, value in sorted(events):
+        key = name.casefold()
+        if action == "RENAME":
+            existing = found.pop(key, None)
+            if existing and value:
+                found[compact_metadata(value).casefold()] = (compact_metadata(value), existing[1])
+        elif value:
+            found[key] = (name, value)
+    return {name: [data_type] for name, data_type in found.values()}
+
+
+def _m_list_rows(value: str) -> list[list[str]]:
+    text = value.strip()
+    if len(text) < 2 or text[0] != "{" or text[-1] != "}":
+        return []
+    rows: list[list[str]] = []
+    for item in _split_m_top_level(text[1:-1]):
+        item = item.strip()
+        if len(item) >= 2 and item[0] == "{" and item[-1] == "}":
+            rows.append(_split_m_top_level(item[1:-1]))
+    return rows
+
+
+def _m_type_expression(value: str) -> str | None:
+    text = compact_metadata(value)
+    if not text:
+        return None
+    pattern = re.compile(
+        r"(?i)^(?:type\s+(?:nullable\s+)?)?"
+        r"(?:any|anynonnull|binary|date|datetime|datetimezone|duration|function|"
+        r"list|logical|none|null|number|record|table|text|time|type|"
+        r"[A-Za-z_][A-Za-z0-9_.]*\.Type)$"
+    )
+    return text if pattern.fullmatch(text) else None
+
+
+def _m_table_type_assignments(expression: str) -> list[tuple[int, list[tuple[str, str]]]]:
+    searchable = _mask_m_strings(expression)
+    result: list[tuple[int, list[tuple[str, str]]]] = []
+    pattern = re.compile(r"(?i)\btype\s+table\s*\[")
+    for match in pattern.finditer(searchable):
+        start = match.end() - 1
+        end = _matching_delimiter(expression, start, "[", "]")
+        if end is None:
+            continue
+        assignments: list[tuple[str, str]] = []
+        for item in _split_m_top_level(expression[start + 1 : end]):
+            parts = _split_m_top_level(item, delimiter="=")
+            if len(parts) != 2:
+                continue
+            column = _decode_m_identifier(parts[0])
+            data_type = _m_type_expression(parts[1])
+            if column and data_type:
+                assignments.append((column, data_type))
+        if assignments:
+            result.append((match.start(), assignments))
+    return result
+
+
+def _decode_m_identifier(value: str) -> str | None:
+    text = value.strip()
+    if text.startswith('#"') and text.endswith('"'):
+        return text[2:-1].replace('""', '"').strip() or None
+    decoded = _decode_m_string(text)
+    if decoded is not None:
+        return decoded
+    return compact_metadata(text) or None
+
+
+def _m_named_string_values(
+    expression: str,
+    names: tuple[str, ...],
+) -> list[tuple[int, str]]:
+    searchable = _mask_m_strings(expression)
+    pattern = re.compile(
+        rf"(?i)(?<![\w])(?:{'|'.join(re.escape(name) for name in names)})\s*="
+    )
+    result: list[tuple[int, str]] = []
+    for match in pattern.finditer(searchable):
+        index = match.end()
+        while index < len(expression) and expression[index].isspace():
+            index += 1
+        token = _m_string_token(expression, index)
+        if token is not None:
+            result.append((match.start(), token))
+    return result
+
+
+def _m_string_token(expression: str, start: int) -> str | None:
+    if start >= len(expression) or expression[start] != '"':
+        return None
+    index = start + 1
+    while index < len(expression):
+        if expression[index] != '"':
+            index += 1
+            continue
+        if index + 1 < len(expression) and expression[index + 1] == '"':
+            index += 2
+            continue
+        return _decode_m_string(expression[start : index + 1])
+    return None
+
+
+def _matching_delimiter(
+    expression: str,
+    start: int,
+    opening: str,
+    closing: str,
+) -> int | None:
+    depth = 0
+    in_string = False
+    index = start
+    while index < len(expression):
+        current = expression[index]
+        following = expression[index + 1] if index + 1 < len(expression) else ""
+        if in_string:
+            if current == '"' and following == '"':
+                index += 2
+                continue
+            if current == '"':
+                in_string = False
+        elif current == '"':
+            in_string = True
+        elif current == opening:
+            depth += 1
+        elif current == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _split_m_top_level(value: str, *, delimiter: str = ",") -> list[str]:
+    items: list[str] = []
+    start = 0
+    parentheses = braces = brackets = 0
+    in_string = False
+    index = 0
+    while index < len(value):
+        current = value[index]
+        following = value[index + 1] if index + 1 < len(value) else ""
+        if in_string:
+            if current == '"' and following == '"':
+                index += 2
+                continue
+            if current == '"':
+                in_string = False
+        elif current == '"':
+            in_string = True
+        elif current == "(":
+            parentheses += 1
+        elif current == ")":
+            parentheses = max(0, parentheses - 1)
+        elif current == "{":
+            braces += 1
+        elif current == "}":
+            braces = max(0, braces - 1)
+        elif current == "[":
+            brackets += 1
+        elif current == "]":
+            brackets = max(0, brackets - 1)
+        elif (
+            current == delimiter
+            and parentheses == 0
+            and braces == 0
+            and brackets == 0
+        ):
+            items.append(value[start:index].strip())
+            start = index + 1
+        index += 1
+    items.append(value[start:].strip())
+    return items
 
 
 def _mask_m_comments(expression: str) -> str:
@@ -756,7 +986,17 @@ def _mask_m_comments(expression: str) -> str:
 
 
 def _function_call_arguments(expression: str, function_name: str) -> list[list[str]]:
-    calls: list[list[str]] = []
+    return [
+        arguments
+        for _, arguments in _located_function_call_arguments(expression, function_name)
+    ]
+
+
+def _located_function_call_arguments(
+    expression: str,
+    function_name: str,
+) -> list[tuple[int, list[str]]]:
+    calls: list[tuple[int, list[str]]] = []
     pattern = re.compile(rf"(?<![\w.]){re.escape(function_name)}\s*\(", re.IGNORECASE)
     searchable = _mask_m_strings(expression)
     for match in pattern.finditer(searchable):
@@ -786,7 +1026,7 @@ def _function_call_arguments(expression: str, function_name: str) -> list[list[s
                 parentheses -= 1
                 if parentheses == 0:
                     arguments.append(expression[start:index].strip())
-                    calls.append(arguments)
+                    calls.append((match.start(), arguments))
                     break
             elif current == "{":
                 braces += 1

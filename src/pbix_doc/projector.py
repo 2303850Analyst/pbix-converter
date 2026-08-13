@@ -13,6 +13,7 @@ from .domain import (
     FilterInfo,
     MeasureInfo,
     PageInfo,
+    QueryInfo,
     VisualInfo,
 )
 from .policy import METADATA_EXCLUSION_POLICY
@@ -49,11 +50,6 @@ class ParagraphBlock:
 
 
 @dataclass(slots=True)
-class CodeBlock:
-    text: str
-
-
-@dataclass(slots=True)
 class ListBlock:
     items: list[str]
     ordered: bool = False
@@ -73,7 +69,7 @@ class SectionBreakBlock:
     orientation: str
 
 
-DocumentBlock = HeadingBlock | ParagraphBlock | CodeBlock | ListBlock | TableBlock | SectionBreakBlock
+DocumentBlock = HeadingBlock | ParagraphBlock | ListBlock | TableBlock | SectionBreakBlock
 
 
 @dataclass(slots=True)
@@ -765,17 +761,24 @@ def _bookmark_ref(
 
 
 def _visual_display_name(visual: VisualInfo, local_id: str) -> str:
-    title = clean_text(visual.title)
-    technical_title = title.strip("{} ")
-    if (
-        title
-        and title.casefold() != clean_text(visual.id).casefold()
-        and not TECHNICAL_VISUAL_NAME_PATTERN.fullmatch(technical_title)
-    ):
+    title = _human_visual_title(visual)
+    if title:
         return title
     match = re.search(r"(\d+)$", clean_text(local_id))
     number = str(int(match.group(1))) if match else clean_text(local_id) or "?"
     return f"Без названия {number}"
+
+
+def _human_visual_title(visual: VisualInfo) -> str | None:
+    title = clean_text(visual.title)
+    technical_title = title.strip("{} ")
+    if (
+        not title
+        or title.casefold() == clean_text(visual.id).casefold()
+        or TECHNICAL_VISUAL_NAME_PATTERN.fullmatch(technical_title)
+    ):
+        return None
+    return title
 
 
 def _bookmark_display_name(bookmark: BookmarkInfo) -> str:
@@ -968,7 +971,7 @@ def _difference_index(
     groups: dict[str, list[tuple[PageInfo, VisualInfo]]] = defaultdict(list)
     for page in pages:
         for visual in page.visuals:
-            title = clean_text(visual.title).strip()
+            title = _human_visual_title(visual)
             if title:
                 groups[title.casefold()].append((page, visual))
     repeated = [items for items in groups.values() if len(items) > 1]
@@ -1130,7 +1133,7 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
                         _query_kind_label(item.kind),
                         ", ".join(item.connection_types) or "—",
                         "; ".join(item.source_details) or "—",
-                        " | ".join(item.connection_strings) or "—",
+                        _query_connection_cell(item),
                     )
                     for item in shown_queries
                 ],
@@ -1141,18 +1144,6 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
         )
         if len(queries) > len(shown_queries):
             blocks.append(ParagraphBlock(OVERFLOW, "warning"))
-        for query in shown_queries:
-            for index, expression in enumerate(query.expressions, 1):
-                suffix = f" — вариант {index}" if len(query.expressions) > 1 else ""
-                blocks.extend(
-                    [
-                        HeadingBlock(
-                            3,
-                            f"M-код: запрос «{clean_text(query.name)}»{suffix}",
-                        ),
-                        CodeBlock(expression),
-                    ]
-                )
     else:
         blocks.append(ParagraphBlock("Метаданные Power Query не найдены или недоступны."))
     if semantic.connections:
@@ -1220,6 +1211,22 @@ def _security_and_sources(model: DocumentationModel) -> list[DocumentBlock]:
     else:
         blocks.append(ParagraphBlock("Метаданные OLS не найдены или недоступны."))
     return blocks
+
+
+def _query_connection_cell(query: QueryInfo) -> str:
+    parts = [
+        clean_text(value, preserve_newlines=True, limit=None)
+        for value in query.connection_strings
+    ]
+    expressions = [
+        clean_text(value, preserve_newlines=True, limit=None)
+        for value in query.expressions
+        if clean_text(value, preserve_newlines=True, limit=None)
+    ]
+    for index, expression in enumerate(expressions, 1):
+        label = "M-код" if len(expressions) == 1 else f"M-код, вариант {index}"
+        parts.append(f"{label}:\n{expression}")
+    return "\n\n".join(parts) or "—"
 
 
 def sanitize_dax(expression: str | None) -> DaxProjection:
