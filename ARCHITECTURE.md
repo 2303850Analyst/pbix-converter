@@ -480,8 +480,11 @@ tests/
 
 scripts/
 ├── build_offline_release.ps1
+├── common.ps1
 ├── install_offline.ps1
-└── run_pbix_doc.ps1
+├── setup_offline.ps1
+├── run_pbix_doc.ps1
+└── start_pbix_doc.cmd
 ```
 
-Direct production dependencies are pinned in `pyproject.toml`; the complete tested transitive set and permitted wheel hashes are pinned in `requirements.lock` for Windows x64 and CPython 3.11–3.13. The build backend is separately pinned by version and hash in `requirements-build.lock`. The release builder downloads only hash-matching binary wheels on a separate build machine, builds the application wheel in an isolated environment, and emits `SHA256SUMS`. VDI installation verifies the manifest and uses pip with `--no-index` and the bundled wheelhouse.
+Direct production dependencies are pinned in `pyproject.toml`; the complete tested transitive set and permitted wheel hashes are pinned in `requirements.lock` for Windows x64 and CPython 3.11–3.13. Each release archive targets one CPython minor version. The build backend is separately pinned by version and hash in `requirements-build.lock`. The release builder downloads only hash-matching binary wheels on a separate build machine, builds the application wheel in an isolated environment, and emits `SHA256SUMS`. VDI setup verifies the manifest, creates a local `.venv`, and uses pip with `--no-index` and the bundled wheelhouse.
