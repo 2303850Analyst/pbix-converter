@@ -228,7 +228,7 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
     mashup_query_rows = optional_records(model, "mashup_queries", issues)
     connection_rows = optional_records(model, "connections", issues)
     query_rows = deduplicate_query_rows(power_query_rows + mashup_query_rows)
-    native_types = native_query_column_types(query_rows)
+    native_types = native_query_column_types(query_rows, issues)
 
     schema_index = {
         (str(rget(item, "TableName", "Table")), str(rget(item, "ColumnName", "Name"))): item
@@ -266,10 +266,12 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
         stats = statistics_index.get((table_name, name), {})
         calculated = calculated_index.get((table_name, name), {})
         cardinality = rget(stats, "Cardinality")
-        source_column = text_or_none(rget(row, "SourceColumn", "SourceName"))
-        native_type = native_types.get((table_name.casefold(), (source_column or name).casefold()))
-        if native_type is None and source_column:
-            native_type = native_types.get((table_name.casefold(), name.casefold()))
+        source_column = identifier_text(rget(row, "SourceColumn", "SourceName"))
+        native_type = (
+            native_types.get((table_name, source_column))
+            if source_column
+            else None
+        )
         table.columns.append(
             ColumnInfo(
                 table_name,
@@ -334,13 +336,13 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
             continue
         name = text_or_none(rget(row, "TableName", "Name"))
         if name:
-            expression = text_or_none(rget(row, "Expression"))
+            expression = query_expression(row)
             connectors = extract_power_query_connection_types(expression or "")
             source_details, connection_strings = extract_power_query_source_metadata(
                 expression or ""
             )
             safe_expression = redact_connection_secrets(expression) if expression else None
-            existing = queries_by_name.get(name.casefold())
+            existing = queries_by_name.get(name)
             if existing:
                 existing.expression_available = existing.expression_available or bool(expression)
                 existing.connection_types = sorted(
@@ -355,7 +357,7 @@ def read_model_metadata(model: Any, issues: list[Issue]) -> SemanticModelInfo:
                 if safe_expression and safe_expression not in existing.expressions:
                     existing.expressions.append(safe_expression)
             else:
-                queries_by_name[name.casefold()] = QueryInfo(
+                queries_by_name[name] = QueryInfo(
                     name,
                     text_or_none(rget(row, "Kind")) or "POWER_QUERY",
                     bool(expression),
@@ -445,30 +447,736 @@ def normalize_model_data_type(value: Any) -> str | None:
     return text_or_none(normalized)
 
 
-def native_query_column_types(rows: list[dict[str, Any]]) -> dict[tuple[str, str], str]:
+def native_query_column_types(
+    rows: list[dict[str, Any]],
+    issues: list[Issue] | None = None,
+) -> dict[tuple[str, str], str]:
+    resolver = _MTypeLineageResolver(rows)
     result: dict[tuple[str, str], str] = {}
-    for row in rows:
-        table = text_or_none(rget(row, "TableName", "Name"))
-        expression = text_or_none(rget(row, "Expression"))
-        if not table or not expression:
-            continue
-        for column, values in extract_native_types(expression).items():
-            result[(table.casefold(), column.casefold())] = "; ".join(values)
+    for table, schema in resolver.resolve_all().items():
+        for column, (_, data_type) in schema.items():
+            result[(table, column)] = data_type
+    if issues is not None and resolver.incomplete:
+        issues.append(
+            Issue(
+                "WARNING",
+                "POWER_QUERY",
+                "M_TYPE_LINEAGE_PARTIAL",
+                "Типы полей источника определены частично: итоговая ветка M содержит неподдерживаемое преобразование",
+            )
+        )
     return result
+
+
+MTypeSchema = dict[str, tuple[str, str]]
+
+
+class _MTypeLineageResolver:
+    _MAX_DEPTH = 512
+    _PRESERVES_SCHEMA = {
+        "Table.Buffer",
+        "Table.Distinct",
+        "Table.FillDown",
+        "Table.FillUp",
+        "Table.FirstN",
+        "Table.LastN",
+        "Table.Range",
+        "Table.RemoveFirstN",
+        "Table.RemoveLastN",
+        "Table.RemoveRowsWithErrors",
+        "Table.ReplaceErrorValues",
+        "Table.ReplaceValue",
+        "Table.ReorderColumns",
+        "Table.ReverseRows",
+        "Table.SelectRows",
+        "Table.Skip",
+        "Table.Sort",
+        "Table.StopFolding",
+    }
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._loaded: dict[str, list[str]] = defaultdict(list)
+        self._shared: dict[str, list[str]] = defaultdict(list)
+        for row in rows:
+            if bool_value(rget(row, "IsParameter")):
+                continue
+            table_name = identifier_text(rget(row, "TableName"))
+            query_name = identifier_text(rget(row, "Name"))
+            name = table_name or query_name
+            expression = query_expression(row)
+            if not name or not expression:
+                continue
+            key = name
+            definitions = self._loaded if table_name else self._shared
+            if expression not in definitions[key]:
+                definitions[key].append(expression)
+        self._cache: dict[str, MTypeSchema] = {}
+        self.incomplete = False
+
+    def resolve_all(self) -> dict[str, MTypeSchema]:
+        result: dict[str, MTypeSchema] = {}
+        for name in self._loaded.keys() | self._shared.keys():
+            if name in self._loaded:
+                schemas = [
+                    self._resolve_expression(expression, {}, frozenset(), frozenset(), 0)
+                    for expression in self._loaded[name]
+                ]
+                schema = self._consensus(schemas)
+            else:
+                schema = self._resolve_query(name, frozenset())
+            if schema:
+                result[name] = schema
+        return result
+
+    def _resolve_query(self, name: str, stack: frozenset[str]) -> MTypeSchema:
+        if name in stack:
+            self.incomplete = True
+            return {}
+        cached = self._cache.get(name)
+        if cached is not None:
+            return dict(cached)
+        next_stack = stack | {name}
+        definitions = self._shared.get(name) or self._loaded.get(name) or ()
+        schemas = [
+            self._resolve_expression(expression, {}, next_stack, frozenset(), 0)
+            for expression in definitions
+        ]
+        resolved = self._consensus(schemas)
+        self._cache[name] = resolved
+        return dict(resolved)
+
+    def _consensus(self, schemas: list[MTypeSchema]) -> MTypeSchema:
+        resolved = _m_schema_consensus(schemas)
+        if any(schema != resolved for schema in schemas if schema):
+            self.incomplete = True
+        return resolved
+
+    def _resolve_expression(
+        self,
+        expression: str,
+        outer_bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        if depth > self._MAX_DEPTH:
+            self.incomplete = True
+            return {}
+        parsed = _m_outer_let(_strip_m_outer_parentheses(expression.strip()))
+        if parsed:
+            local, output = parsed
+            bindings = dict(outer_bindings)
+            bindings.update(local)
+            return self._resolve_term(
+                output, bindings, query_stack, binding_stack, depth + 1
+            )
+        return self._resolve_term(
+            expression, outer_bindings, query_stack, binding_stack, depth + 1
+        )
+
+    def _resolve_term(
+        self,
+        expression: str,
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        if depth > self._MAX_DEPTH:
+            self.incomplete = True
+            return {}
+        text = _strip_m_outer_parentheses(expression.strip())
+        reference = _m_reference_name(text)
+        if reference:
+            key = reference
+            if key in bindings:
+                token = (id(bindings), key)
+                if token in binding_stack:
+                    self.incomplete = True
+                    return {}
+                return self._resolve_expression(
+                    bindings[key],
+                    bindings,
+                    query_stack,
+                    binding_stack | {token},
+                    depth + 1,
+                )
+            if key in self._shared or key in self._loaded:
+                return self._resolve_query(key, query_stack)
+            return {}
+
+        call = _m_root_call(text)
+        if not call:
+            if text.startswith("if "):
+                self.incomplete = True
+            return {}
+        function_name, arguments = call
+
+        if function_name == "Table.TransformColumnTypes":
+            return self._transform_column_types(
+                arguments, bindings, query_stack, binding_stack, depth
+            )
+        if function_name == "Table.TransformColumns":
+            return self._transform_columns(
+                arguments, bindings, query_stack, binding_stack, depth
+            )
+        if function_name == "Table.AddColumn":
+            return self._add_column(arguments, bindings, query_stack, binding_stack, depth)
+        if function_name == "Table.RenameColumns":
+            return self._rename_columns(
+                arguments, bindings, query_stack, binding_stack, depth
+            )
+        if function_name in {"Value.ReplaceType", "#table"}:
+            return self._replace_type(
+                function_name, arguments, bindings, query_stack, binding_stack, depth
+            )
+        if function_name in {"Table.FromRecords", "Table.FromRows"}:
+            return self._declared_table_type(arguments, 1, bindings)
+        if function_name == "Table.SelectColumns":
+            return self._select_columns(
+                arguments, bindings, query_stack, binding_stack, depth
+            )
+        if function_name == "Table.RemoveColumns":
+            return self._remove_columns(
+                arguments, bindings, query_stack, binding_stack, depth
+            )
+        if function_name == "Table.Combine":
+            return self._combine(
+                arguments, bindings, query_stack, binding_stack, depth
+            )
+        if function_name in self._PRESERVES_SCHEMA and arguments:
+            return self._resolve_term(
+                arguments[0], bindings, query_stack, binding_stack, depth + 1
+            )
+        if function_name.startswith("Table.") or (
+            arguments
+            and self._resolve_term(
+                arguments[0], bindings, query_stack, binding_stack, depth + 1
+            )
+        ):
+            self.incomplete = True
+        return {}
+
+    def _base_schema(
+        self,
+        arguments: list[str],
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        if not arguments:
+            return {}
+        return self._resolve_term(
+            arguments[0], bindings, query_stack, binding_stack, depth + 1
+        )
+
+    def _transform_column_types(
+        self,
+        arguments: list[str],
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        schema = self._base_schema(
+            arguments, bindings, query_stack, binding_stack, depth
+        )
+        if len(arguments) < 2:
+            return {}
+        rows = _m_constant_rows(arguments[1], bindings)
+        if rows is None:
+            self.incomplete = True
+            return {}
+        for row in rows:
+            if len(row) != 2:
+                self.incomplete = True
+                return {}
+            column = _decode_m_string(row[0])
+            data_type = _m_type_expression(row[1])
+            if not column or not data_type:
+                self.incomplete = True
+                return {}
+            _set_m_schema_type(schema, column, data_type)
+        return schema
+
+    def _transform_columns(
+        self,
+        arguments: list[str],
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        schema = self._base_schema(
+            arguments, bindings, query_stack, binding_stack, depth
+        )
+        if len(arguments) < 2:
+            return {}
+        rows = _m_constant_rows(arguments[1], bindings)
+        if rows is None:
+            self.incomplete = True
+            return {}
+        if len(arguments) >= 3 and arguments[2].strip() != "null":
+            schema = {}
+        for row in rows:
+            if len(row) not in {2, 3}:
+                self.incomplete = True
+                return {}
+            column = _decode_m_string(row[0]) if row else None
+            if not column:
+                self.incomplete = True
+                return {}
+            data_type = _m_type_expression(row[-1]) if len(row) >= 3 else None
+            if data_type:
+                _set_m_schema_type(schema, column, data_type)
+            else:
+                schema.pop(column, None)
+        return schema
+
+    def _add_column(
+        self,
+        arguments: list[str],
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        schema = self._base_schema(
+            arguments, bindings, query_stack, binding_stack, depth
+        )
+        if len(arguments) < 2:
+            return schema
+        column = _decode_m_string(arguments[1])
+        if not column:
+            return schema
+        data_type = _m_type_expression(arguments[3]) if len(arguments) >= 4 else None
+        if data_type:
+            _set_m_schema_type(schema, column, data_type)
+        else:
+            schema.pop(column, None)
+        return schema
+
+    def _rename_columns(
+        self,
+        arguments: list[str],
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        schema = self._base_schema(
+            arguments, bindings, query_stack, binding_stack, depth
+        )
+        if len(arguments) < 2:
+            return {}
+        rows = _m_constant_rows(arguments[1], bindings)
+        if rows is None:
+            self.incomplete = True
+            return {}
+        for row in rows:
+            if len(row) != 2:
+                self.incomplete = True
+                return {}
+            source = _decode_m_string(row[0])
+            target = _decode_m_string(row[1])
+            if not source or not target:
+                self.incomplete = True
+                return {}
+            known = schema.pop(source, None)
+            schema.pop(target, None)
+            if known:
+                schema[target] = (target, known[1])
+        return schema
+
+    def _replace_type(
+        self,
+        function_name: str,
+        arguments: list[str],
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        type_index = 1 if function_name == "Value.ReplaceType" else 0
+        return self._declared_table_type(
+            arguments,
+            type_index,
+            bindings,
+            required=function_name == "Value.ReplaceType",
+        )
+
+    def _declared_table_type(
+        self,
+        arguments: list[str],
+        type_index: int,
+        bindings: dict[str, str],
+        *,
+        required: bool = False,
+    ) -> MTypeSchema:
+        if len(arguments) <= type_index:
+            return {}
+        type_expression = _m_constant_expression(arguments[type_index], bindings)
+        assignments = _m_exact_table_type(type_expression)
+        if assignments is None:
+            if required or re.search(
+                r"\btype\s+table\b", _mask_m_strings(type_expression)
+            ):
+                self.incomplete = True
+            return {}
+        schema: MTypeSchema = {}
+        for column, data_type in assignments:
+            _set_m_schema_type(schema, column, data_type)
+        return schema
+
+    def _select_columns(
+        self,
+        arguments: list[str],
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        schema = self._base_schema(
+            arguments, bindings, query_stack, binding_stack, depth
+        )
+        if len(arguments) < 2:
+            return {}
+        names = _m_constant_strings(arguments[1], bindings)
+        if names is None:
+            self.incomplete = True
+            return {}
+        selected = set(names)
+        return {key: value for key, value in schema.items() if key in selected}
+
+    def _remove_columns(
+        self,
+        arguments: list[str],
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        schema = self._base_schema(
+            arguments, bindings, query_stack, binding_stack, depth
+        )
+        if len(arguments) < 2:
+            return {}
+        names = _m_constant_strings(arguments[1], bindings)
+        if names is None:
+            self.incomplete = True
+            return {}
+        for name in names:
+            schema.pop(name, None)
+        return schema
+
+    def _combine(
+        self,
+        arguments: list[str],
+        bindings: dict[str, str],
+        query_stack: frozenset[str],
+        binding_stack: frozenset[tuple[int, str]],
+        depth: int,
+    ) -> MTypeSchema:
+        if not arguments:
+            return {}
+        items = _m_constant_list(arguments[0], bindings)
+        if items is None:
+            self.incomplete = True
+            return {}
+        schemas = [
+            self._resolve_term(item, bindings, query_stack, binding_stack, depth + 1)
+            for item in items
+        ]
+        return self._consensus(schemas)
+
+
+def _m_schema_consensus(schemas: list[MTypeSchema]) -> MTypeSchema:
+    if not schemas:
+        return {}
+    common = set(schemas[0])
+    for schema in schemas[1:]:
+        common.intersection_update(schema)
+    result: MTypeSchema = {}
+    for column in common:
+        values = [schema[column] for schema in schemas]
+        if len({value[1] for value in values}) == 1:
+            result[column] = values[0]
+    return result
+
+
+def _set_m_schema_type(schema: MTypeSchema, column: str, data_type: str) -> None:
+    name = column
+    normalized_type = compact_metadata(data_type)
+    if name and normalized_type:
+        schema[name] = (name, f"M: {normalized_type}")
+
+
+def _m_outer_let(expression: str) -> tuple[dict[str, str], str] | None:
+    text = _mask_m_comments(expression).strip()
+    match = re.match(r"^let\b", text)
+    if not match:
+        return None
+    output_position = _m_outer_in_position(text, match.end())
+    if output_position is None:
+        return None
+    bindings: dict[str, str] = {}
+    for item in _split_m_top_level(text[match.end() : output_position]):
+        assignment = _m_top_level_equal_position(item)
+        if assignment is None:
+            continue
+        name = _decode_m_identifier(item[:assignment])
+        value = item[assignment + 1 :].strip()
+        if name and value:
+            bindings[name] = value
+    output = text[output_position + 2 :].strip()
+    return (bindings, output) if output else None
+
+
+def _m_outer_in_position(expression: str, start: int) -> int | None:
+    parentheses = braces = brackets = nested_lets = 0
+    in_string = False
+    index = start
+    while index < len(expression):
+        current = expression[index]
+        following = expression[index + 1] if index + 1 < len(expression) else ""
+        if in_string:
+            if current == '"' and following == '"':
+                index += 2
+                continue
+            if current == '"':
+                in_string = False
+            index += 1
+            continue
+        if current == '"':
+            in_string = True
+            index += 1
+            continue
+        if current == "(":
+            parentheses += 1
+        elif current == ")":
+            parentheses = max(0, parentheses - 1)
+        elif current == "{":
+            braces += 1
+        elif current == "}":
+            braces = max(0, braces - 1)
+        elif current == "[":
+            brackets += 1
+        elif current == "]":
+            brackets = max(0, brackets - 1)
+        elif parentheses == 0 and braces == 0 and brackets == 0 and (
+            current.isalpha() or current == "_"
+        ):
+            end = index + 1
+            while end < len(expression) and (
+                expression[end].isalnum() or expression[end] == "_"
+            ):
+                end += 1
+            keyword = expression[index:end]
+            if keyword == "let":
+                nested_lets += 1
+            elif keyword == "in":
+                if nested_lets:
+                    nested_lets -= 1
+                else:
+                    return index
+            index = end
+            continue
+        index += 1
+    return None
+
+
+def _m_top_level_equal_position(expression: str) -> int | None:
+    parentheses = braces = brackets = 0
+    in_string = False
+    index = 0
+    while index < len(expression):
+        current = expression[index]
+        following = expression[index + 1] if index + 1 < len(expression) else ""
+        if in_string:
+            if current == '"' and following == '"':
+                index += 2
+                continue
+            if current == '"':
+                in_string = False
+        elif current == '"':
+            in_string = True
+        elif current == "(":
+            parentheses += 1
+        elif current == ")":
+            parentheses = max(0, parentheses - 1)
+        elif current == "{":
+            braces += 1
+        elif current == "}":
+            braces = max(0, braces - 1)
+        elif current == "[":
+            brackets += 1
+        elif current == "]":
+            brackets = max(0, brackets - 1)
+        elif current == "=" and parentheses == 0 and braces == 0 and brackets == 0:
+            return index
+        index += 1
+    return None
+
+
+def _strip_m_outer_parentheses(expression: str) -> str:
+    text = expression.strip()
+    while text.startswith("("):
+        end = _matching_delimiter(text, 0, "(", ")")
+        if end != len(text) - 1:
+            break
+        text = text[1:-1].strip()
+    return text
+
+
+def _m_reference_name(expression: str) -> str | None:
+    text = expression.strip()
+    if text.startswith('#"') and text.endswith('"'):
+        return _decode_m_identifier(text)
+    if re.fullmatch(r"[_\w]+", text, re.UNICODE):
+        return text
+    return None
+
+
+def _m_root_call(expression: str) -> tuple[str, list[str]] | None:
+    text = _mask_m_comments(expression).strip()
+    match = re.match(r"^(#?[A-Za-z_][A-Za-z0-9_.]*)\s*\(", text)
+    if not match:
+        return None
+    opening = text.find("(", match.start())
+    closing = _matching_delimiter(text, opening, "(", ")")
+    if closing is None or text[closing + 1 :].strip():
+        return None
+    return match.group(1), _split_m_top_level(text[opening + 1 : closing])
+
+
+def _m_constant_expression(
+    expression: str,
+    bindings: dict[str, str],
+    seen: frozenset[str] = frozenset(),
+) -> str:
+    text = expression.strip()
+    reference = _m_reference_name(text)
+    if not reference:
+        return text
+    key = reference
+    if key not in bindings or key in seen:
+        return text
+    return _m_constant_expression(bindings[key], bindings, seen | {key})
+
+
+def _m_constant_rows(
+    expression: str,
+    bindings: dict[str, str],
+) -> list[list[str]] | None:
+    text = _m_constant_expression(expression, bindings).strip()
+    if len(text) < 2 or text[0] != "{" or text[-1] != "}":
+        return None
+    if not text[1:-1].strip():
+        return []
+    items = _split_m_top_level(text[1:-1])
+    if len(items) >= 2 and _decode_m_string(items[0]) is not None:
+        return [items]
+    rows: list[list[str]] = []
+    for item in items:
+        resolved = _m_constant_expression(item, bindings).strip()
+        if len(resolved) < 2 or resolved[0] != "{" or resolved[-1] != "}":
+            return None
+        nested = _m_constant_rows(resolved, bindings)
+        if nested is None:
+            return None
+        rows.extend(nested)
+    return rows
+
+
+def _m_constant_strings(
+    expression: str,
+    bindings: dict[str, str],
+) -> list[str] | None:
+    text = _m_constant_expression(expression, bindings).strip()
+    scalar = _decode_m_string(text)
+    if scalar is not None:
+        return [scalar]
+    if len(text) < 2 or text[0] != "{" or text[-1] != "}":
+        return None
+    if not text[1:-1].strip():
+        return []
+    result: list[str] = []
+    for item in _split_m_top_level(text[1:-1]):
+        resolved = _m_constant_expression(item, bindings)
+        value = _decode_m_string(resolved)
+        if value is None:
+            return None
+        result.append(value)
+    return result
+
+
+def _m_constant_list(
+    expression: str,
+    bindings: dict[str, str],
+) -> list[str] | None:
+    text = _m_constant_expression(expression, bindings).strip()
+    if len(text) < 2 or text[0] != "{" or text[-1] != "}":
+        return None
+    if not text[1:-1].strip():
+        return []
+    return _split_m_top_level(text[1:-1])
+
+
+def _m_exact_table_type(expression: str) -> list[tuple[str, str]] | None:
+    text = _strip_m_outer_parentheses(expression.strip())
+    match = re.match(r"^type\s+table\s*\[", text)
+    if not match:
+        return None
+    opening = match.end() - 1
+    closing = _matching_delimiter(text, opening, "[", "]")
+    if closing is None or text[closing + 1 :].strip():
+        return None
+    assignments: list[tuple[str, str]] = []
+    for item in _split_m_top_level(text[opening + 1 : closing]):
+        if not item:
+            continue
+        position = _m_top_level_equal_position(item)
+        if position is None:
+            return None
+        column = _decode_m_identifier(item[:position])
+        data_type = _m_type_expression(item[position + 1 :])
+        if not column or not data_type:
+            return None
+        assignments.append((column, data_type))
+    return assignments
 
 
 def deduplicate_query_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for row in rows:
-        name = text_or_none(rget(row, "TableName", "Name")) or ""
-        expression = text_or_none(rget(row, "Expression")) or ""
-        key = (name.casefold(), expression)
+        name = identifier_text(rget(row, "TableName", "Name")) or ""
+        expression = query_expression(row) or ""
+        key = (name, expression)
         if key in seen:
             continue
         seen.add(key)
         result.append(row)
     return result
+
+
+def query_expression(row: dict[str, Any]) -> str | None:
+    for name in ("Expression", "QueryDefinition"):
+        value = rget(row, name)
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        expression = text_or_none(value)
+        if expression:
+            return expression
+    return None
+
+
+def identifier_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
 
 
 POWER_QUERY_CONNECTORS = {
@@ -793,7 +1501,7 @@ def _m_type_expression(value: str) -> str | None:
     if not text:
         return None
     pattern = re.compile(
-        r"(?i)^(?:type\s+(?:nullable\s+)?)?"
+        r"(?i)^(?:(?:type\s+)?nullable\s+|type\s+)?"
         r"(?:any|anynonnull|binary|date|datetime|datetimezone|duration|function|"
         r"list|logical|none|null|number|record|table|text|time|type|"
         r"[A-Za-z_][A-Za-z0-9_.]*\.Type)$"
@@ -827,7 +1535,7 @@ def _m_table_type_assignments(expression: str) -> list[tuple[int, list[tuple[str
 def _decode_m_identifier(value: str) -> str | None:
     text = value.strip()
     if text.startswith('#"') and text.endswith('"'):
-        return text[2:-1].replace('""', '"').strip() or None
+        return text[2:-1].replace('""', '"') or None
     decoded = _decode_m_string(text)
     if decoded is not None:
         return decoded
@@ -901,7 +1609,7 @@ def _matching_delimiter(
 def _split_m_top_level(value: str, *, delimiter: str = ",") -> list[str]:
     items: list[str] = []
     start = 0
-    parentheses = braces = brackets = 0
+    parentheses = braces = brackets = nested_lets = 0
     in_string = False
     index = 0
     while index < len(value):
@@ -927,11 +1635,27 @@ def _split_m_top_level(value: str, *, delimiter: str = ",") -> list[str]:
             brackets += 1
         elif current == "]":
             brackets = max(0, brackets - 1)
+        elif parentheses == 0 and braces == 0 and brackets == 0 and (
+            current.isalpha() or current == "_"
+        ):
+            end = index + 1
+            while end < len(value) and (
+                value[end].isalnum() or value[end] == "_"
+            ):
+                end += 1
+            keyword = value[index:end]
+            if keyword == "let":
+                nested_lets += 1
+            elif keyword == "in" and nested_lets:
+                nested_lets -= 1
+            index = end
+            continue
         elif (
             current == delimiter
             and parentheses == 0
             and braces == 0
             and brackets == 0
+            and nested_lets == 0
         ):
             items.append(value[start:index].strip())
             start = index + 1
