@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_FILES = (
     "scripts/common.ps1",
     "scripts/build_offline_release.ps1",
+    "scripts/build_windows_exe.ps1",
     "scripts/install_offline.ps1",
     "scripts/setup_offline.ps1",
     "scripts/run_pbix_doc.ps1",
@@ -54,6 +55,15 @@ class OfflineReleaseContractTests(unittest.TestCase):
         self.assertGreaterEqual(install.count("--no-index"), 2)
         self.assertLess(install.index("$actualRuntime -ne $targetRuntime"), install.index("pip --isolated"))
         self.assertLess(setup.index("-CheckRuntimeOnly"), setup.index("-m venv"))
+
+    def test_exe_builder_embeds_dependencies_without_runtime_downloads(self) -> None:
+        build = ROOT.joinpath("scripts/build_windows_exe.ps1").read_text(encoding="ascii")
+        spec = ROOT.joinpath("packaging/PBIXConverter.spec").read_text(encoding="utf-8")
+
+        self.assertIn("requirements-exe-build.lock", build)
+        self.assertIn("PyInstaller", build)
+        self.assertIn('console=False', spec)
+        self.assertIn('copy_metadata("pbixray")', spec)
 
 
 if __name__ == "__main__":

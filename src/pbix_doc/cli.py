@@ -12,6 +12,12 @@ from .projector import overall_status
 from .runtime import RuntimePolicyViolation
 
 
+def _emit(message: str, *, error: bool = False) -> None:
+    stream = sys.stderr if error else sys.stdout
+    if stream is not None:
+        print(message, file=stream, flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pbix-doc", description="Local PBIX to DOCX documentation generator")
     parser.add_argument("input", nargs="?", type=Path, help="Input .pbix file")
@@ -35,14 +41,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.input,
             args.output,
             Options(limit),
-            lambda message: print(message, flush=True),
+            _emit,
         )
     except RuntimePolicyViolation as error:
-        print(f"Критическая ошибка политики VDI: {error}", file=sys.stderr)
+        _emit(f"Критическая ошибка политики VDI: {error}", error=True)
         return 4
     except Exception as error:
-        print(f"Ошибка: {error}", file=sys.stderr)
+        _emit(f"Ошибка: {error}", error=True)
         return 1
     status = overall_status(model)
-    print(f"Статус: {status}")
+    _emit(f"Статус: {status}")
     return 0 if status == "OK" else 2

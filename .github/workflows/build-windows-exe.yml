@@ -1,0 +1,48 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Build self-contained package
+        shell: powershell
+        run: >-
+          .\scripts\build_windows_exe.ps1
+          -Python python
+          -OutputDirectory "$env:RUNNER_TEMP\PBIXConverter-windows-x64"
+      - name: Smoke-test frozen package
+        shell: powershell
+        run: |
+          $package = "$env:RUNNER_TEMP\PBIXConverter-windows-x64.zip"
+          $expanded = "$env:RUNNER_TEMP\PBIXConverter-smoke"
+          Expand-Archive -LiteralPath $package -DestinationPath $expanded
+          $exe = Join-Path $expanded "PBIXConverter.exe"
+          $check = Start-Process -FilePath $exe -ArgumentList "--self-check" -Wait -PassThru
+          if ($check.ExitCode -ne 0) { throw "Frozen dependency self-check failed" }
+          $output = Join-Path $env:RUNNER_TEMP "synthetic.docx"
+          $conversion = Start-Process -FilePath $exe -ArgumentList @(
+            (Resolve-Path ".\examples\synthetic_representative.pbix").Path,
+            $output,
+            "--no-examples"
+          ) -Wait -PassThru
+          if ($conversion.ExitCode -ne 2 -or -not (Test-Path -LiteralPath $output -PathType Leaf)) {
+            throw "Frozen synthetic conversion failed"
+          }
+          python -c "import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; assert 'word/document.xml' in z.namelist()" $output
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: PBIXConverter-windows-x64
+          path: ${{ runner.temp }}\PBIXConverter-windows-x64.zip
+          if-no-files-found: error
+          compression-level: 0

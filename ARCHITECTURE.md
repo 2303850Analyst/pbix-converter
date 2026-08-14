@@ -45,7 +45,7 @@ The application:
 
 The audit guards are application-level regression controls, not a sandbox. They do not govern native DLL networking that bypasses CPython audit events, code executed before the production entry point, other processes, Citrix channels, or filesystem access to a user-selected UNC/mapped path. A selected network path may cause Windows to use SMB; this is an explicit user-directed filesystem operation, not autonomous application egress. Citrix clipboard, client-drive, USB, printing, session recording, network policies, firewall, and AppLocker/WDAC are controlled by VDI administrators and remain the authoritative outer enforcement layer.
 
-Development may use Git and synchronized development folders, but real corporate PBIX files must not be processed there. A VDI production release contains application wheels, pinned dependency wheels, checksums, and offline scripts only; it contains no `.git` directory and performs no package download during installation or execution.
+Development may use Git and synchronized development folders, but real corporate PBIX files must not be processed there. The preferred VDI release is a frozen Windows x64 folder containing `PBIXConverter.exe`, an embedded CPython runtime, pinned dependencies, and checksums. It contains no `.git`, source report, package manager, or updater and performs no download during execution. The wheelhouse-based offline package remains available as a fallback delivery format.
 
 ## 2. Processing pipeline
 
@@ -480,6 +480,7 @@ tests/
 
 scripts/
 ├── build_offline_release.ps1
+├── build_windows_exe.ps1
 ├── common.ps1
 ├── install_offline.ps1
 ├── setup_offline.ps1
