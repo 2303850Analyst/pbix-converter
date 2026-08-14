@@ -452,6 +452,7 @@ The DOCX is intended for manual import through the built-in Word import in Atlas
 1 = input could not be read
 3 = output could not be written
 4 = a VDI runtime policy blocked a network or external-process operation
+5 = the frozen EXE package is incomplete or damaged
 ```
 
 Partial output is preferred whenever at least one meaningful subsystem succeeded.
@@ -488,4 +489,4 @@ scripts/
 └── start_pbix_doc.cmd
 ```
 
-Direct production dependencies are pinned in `pyproject.toml`; the complete tested transitive set and permitted wheel hashes are pinned in `requirements.lock` for Windows x64 and CPython 3.11–3.13. Each release archive targets one CPython minor version. The build backend is separately pinned by version and hash in `requirements-build.lock`. The release builder downloads only hash-matching binary wheels on a separate build machine, builds the application wheel in an isolated environment, and emits `SHA256SUMS`. VDI setup verifies the manifest, creates a local `.venv`, and uses pip with `--no-index` and the bundled wheelhouse.
+Direct production dependencies are pinned in `pyproject.toml`; the complete tested transitive set and permitted wheel hashes are pinned in `requirements.lock`. The preferred Windows x64 release freezes CPython 3.12 and all runtime dependencies into the EXE folder, is built with the separately pinned `requirements-exe-build.lock`, and emits `SHA256SUMS`. It requires neither Python nor package installation on VDI. The fallback wheelhouse archive targets one CPython minor version; its setup verifies the manifest, creates a local `.venv`, and uses pip with `--no-index` and the bundled wheelhouse.

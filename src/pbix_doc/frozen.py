@@ -12,6 +12,7 @@ def verify_bundled_dependencies() -> None:
     import numpy
     import pandas
     import pbixray  # noqa: F401
+    import tkinter
     import xmhuffman  # noqa: F401
     from docx import Document
     from importlib.metadata import version
@@ -29,6 +30,8 @@ def verify_bundled_dependencies() -> None:
     Xpress8()
     Xpress9()
     Document()
+    if not tkinter.Tcl().eval("info patchlevel"):
+        raise RuntimeError("Tcl/Tk self-check failed")
     version("pbixray")
 
 
@@ -41,6 +44,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     install_runtime_guards()
     try:
         verify_bundled_dependencies()
+    except RuntimePolicyViolation:
+        if args != ["--self-check"]:
+            _show_error("PBIX Converter", "Операция заблокирована политикой безопасности VDI.")
+        return 4
     except Exception:
         if args != ["--self-check"]:
             _show_error(
