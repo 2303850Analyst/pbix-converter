@@ -18,6 +18,27 @@ jobs:
         with:
           python-version: "3.12"
           architecture: x64
+      - name: Smoke-test committed root EXE
+        shell: powershell
+        run: |
+          $source = (Resolve-Path ".\PBIXConverter.exe").Path
+          if ((Get-Item -LiteralPath $source).Length -ge 100000000) {
+            throw "Root EXE exceeds the GitHub blob limit"
+          }
+          $testRoot = Join-Path $env:RUNNER_TEMP "PBIX Converter Root Test"
+          New-Item -ItemType Directory -Path $testRoot | Out-Null
+          $exe = Join-Path $testRoot "PBIXConverter.exe"
+          Copy-Item -LiteralPath $source -Destination $exe
+          $check = Start-Process -FilePath $exe -ArgumentList "--self-check" -Wait -PassThru
+          if ($check.ExitCode -ne 0) { throw "Root EXE self-check failed" }
+          $input = (Resolve-Path ".\examples\synthetic_representative.pbix").Path
+          $output = Join-Path $testRoot "synthetic.docx"
+          $arguments = '"' + $input + '" "' + $output + '" --no-examples'
+          $conversion = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru
+          if ($conversion.ExitCode -ne 2 -or -not (Test-Path -LiteralPath $output -PathType Leaf)) {
+            throw "Root EXE synthetic conversion failed"
+          }
+          python -c "import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; assert 'word/document.xml' in z.namelist()" $output
       - name: Build self-contained package
         shell: powershell
         run: >-
@@ -33,12 +54,10 @@ jobs:
           $exe = Join-Path $expanded "PBIXConverter.exe"
           $check = Start-Process -FilePath $exe -ArgumentList "--self-check" -Wait -PassThru
           if ($check.ExitCode -ne 0) { throw "Frozen dependency self-check failed" }
+          $input = (Resolve-Path ".\examples\synthetic_representative.pbix").Path
           $output = Join-Path $env:RUNNER_TEMP "synthetic.docx"
-          $conversion = Start-Process -FilePath $exe -ArgumentList @(
-            (Resolve-Path ".\examples\synthetic_representative.pbix").Path,
-            $output,
-            "--no-examples"
-          ) -Wait -PassThru
+          $arguments = '"' + $input + '" "' + $output + '" --no-examples'
+          $conversion = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru
           if ($conversion.ExitCode -ne 2 -or -not (Test-Path -LiteralPath $output -PathType Leaf)) {
             throw "Frozen synthetic conversion failed"
           }
