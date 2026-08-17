@@ -26,3 +26,10 @@
 - Never describe extraction support as complete without representative PBIX fixtures and passing tests.
 - Maintain unit tests, integration fixtures, and golden DOCX outputs, including structural OOXML checks and rendered-page review for representative deliverables.
 - A synthetic fixture must always be labeled as synthetic and must never be represented as a real or validated PBIX file.
+
+## Data Compass target
+
+- `DATA_COMPASS_ARCHITECTURE.md` is the approved target architecture for the separate Data Compass / Apache Superset ZIP-to-DOCX converter.
+- Data Compass support must not change the locked PBIX input contract or introduce Superset-specific parsing into `pbix_doc`.
+- Its DOCX must follow the PBIX document structure and presentation wherever equivalent metadata exists, while completely omitting bookmarks, Power Query, Power BI model relationships, DAX, RLS/OLS placeholders, and any other entities not physically present in the export.
+- Empty substitute sections are forbidden. Conditional sections such as interactions or access restrictions appear only when the archive contains reliable supporting metadata.

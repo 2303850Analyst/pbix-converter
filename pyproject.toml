@@ -7,10 +7,11 @@ name = "pbix-doc"
 version = "0.5.0"
 description = "Local PBIX to DOCX documentation generator"
 requires-python = ">=3.11"
-dependencies = ["pbixray==0.15.4", "python-docx==1.2.0"]
+dependencies = ["pbixray==0.15.4", "python-docx==1.2.0", "PyYAML==6.0.3"]
 
 [project.scripts]
 pbix-doc = "pbix_doc.bootstrap:main"
+data-compass-doc = "data_compass.bootstrap:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

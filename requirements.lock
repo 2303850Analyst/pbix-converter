@@ -18,6 +18,10 @@ pandas==3.0.5 \
     --hash=sha256:0d298e951f23016ce4699951d044ae6418dbc91bf68cefca0f77666fcbb4e5c6
 pbixray==0.15.4 \
     --hash=sha256:9fabdf0be595095e4705180e251e742288cca5f1d08fd843ea71e721c8efb5fd
+PyYAML==6.0.3 \
+    --hash=sha256:9f3bfb4965eb874431221a3ff3fdcddc7e74e3b07799e0e84ca4a0f867d449bf \
+    --hash=sha256:5fcd34e47f6e0b794d17de1b4ff496c00986e1c83f7ab2fb8fcfe9616ff7477b \
+    --hash=sha256:79005a0d97d5ddabfeeea4cf676af11e647e41d81c9a7722a193022accdb6b7c
 python-docx==1.2.0 \
     --hash=sha256:3fd478f3250fbbbfd3b94fe1e985955737c145627498896a8a6bf81f4baf66c7
 python-dateutil==2.9.0.post0 \
