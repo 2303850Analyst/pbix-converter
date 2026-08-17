@@ -494,7 +494,7 @@ class PowerQuerySourceTypeLineageTests(unittest.TestCase):
         )
 
         self.assertEqual("amount_net", registry.rows[0][6])
-        self.assertEqual("Currency.Type", registry.rows[0][7])
+        self.assertEqual("Currency", registry.rows[0][7])
 
 
 if __name__ == "__main__":

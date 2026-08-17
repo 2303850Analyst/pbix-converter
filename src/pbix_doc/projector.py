@@ -898,7 +898,9 @@ def _source_name(entry: FieldRegistryEntry) -> str:
 def _source_type(entry: FieldRegistryEntry) -> str:
     if entry.native_data_type:
         value = clean_text(entry.native_data_type)
-        return re.sub(r"(^|;\s*)M:\s*", r"\1", value)
+        value = re.sub(r"(^|;\s*)M:\s*", r"\1", value)
+        value = re.sub(r"(^|;\s*)type\s+", r"\1", value, flags=re.IGNORECASE)
+        return re.sub(r"\.Type\b", "", value)
     return "—"
 
 
