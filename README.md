@@ -302,32 +302,60 @@ DOCX повторяет структуру PBIX-документа только 
 
 ## Как устроена программа
 
+### Архитектура PBIX → DOCX
+
 ```mermaid
 flowchart LR
-    A[Локальный GUI или CLI] --> G[Offline runtime guards]
-    G --> P0[PBIXConverter]
-    G --> C0[DataCompassConverter]
+    A[PBIXConverter EXE или Python CLI] --> B[Offline runtime guards]
+    B --> C[Выбор одного PBIX и пути DOCX]
+    C --> D[PBIX preflight и container reader]
 
-    P0 --> P1[PBIX preflight и container]
-    P1 --> P2[PBIR или Legacy parser]
-    P1 --> P3[PBIXRay semantic adapter]
-    P2 --> P4[PBIX normalized model]
-    P3 --> P4
-    P4 --> P5[PBIX policy и DocumentProjector]
+    D --> E{Формат отчёта}
+    E -->|PBIR| F[PBIR parser]
+    E -->|Legacy| G[Report/Layout parser]
+    D --> H[PBIXRay semantic adapter]
+    H --> I[Модель, Power Query, DAX, RLS и OLS]
+    H --> J[(Временная рабочая папка)]
+    J --> K[Проверяемая очистка]
 
-    C0 --> C1[ZIP preflight]
-    C1 --> C2[Safe YAML и JSON]
-    C2 --> C3[Superset adapter и UUID resolver]
-    C3 --> C4[Compass normalized model]
-    C4 --> C5[Compass policy и DocumentProjector]
+    F --> L[PBIX normalized model]
+    G --> L
+    I --> K
+    K --> L
+    L --> M[Field resolver и ValueExposurePolicy]
+    M --> N[PBIX DocumentProjector]
+    N --> O[SafeDocumentModel]
+    O --> P[Общий компактный DOCX renderer]
+    P --> Q[OOXML validator]
+    Q --> R[Атомарная запись DOCX]
 
-    P5 --> S[SafeDocumentModel]
-    C5 --> S
-    S --> R[Общий компактный DOCX renderer]
-    R --> V[OOXML validator]
-    V --> W[Атомарная запись DOCX]
+    B -. блокирует .-> X[Сеть, webhooks, cloud API и внешние процессы]
+```
 
-    G -. блокирует .-> X[Сеть, webhooks, cloud API и внешние процессы]
+### Архитектура Data Compass ZIP → DOCX
+
+```mermaid
+flowchart LR
+    A[DataCompassConverter EXE или Python CLI] --> B[Offline runtime guards]
+    B --> C[Выбор одного export ZIP и пути DOCX]
+    C --> D[ZIP preflight]
+
+    D --> E[Проверка путей, дублей и лимитов]
+    E --> F[Safe YAML и JSON reader]
+    F --> G[Определение dialect и версии]
+    G --> H[Versioned Superset adapter]
+    H --> I[UUID и layout reference resolver]
+
+    I --> J[Compass normalized model]
+    J --> K[CompassExposurePolicy]
+    K --> L[Валидация полноты и ссылок]
+    L --> M[Data Compass DocumentProjector]
+    M --> N[SafeDocumentModel]
+    N --> O[Общий компактный DOCX renderer]
+    O --> P[OOXML validator]
+    P --> Q[Атомарная запись DOCX]
+
+    B -. блокирует .-> X[Data Compass API, БД, сеть и внешние процессы]
 ```
 
 У конвертеров отдельные входные адаптеры, доменные модели, политики и проекторы. Superset-специфичный код не попадает в `pbix_doc`, а PBIX-парсеры не читают Data Compass ZIP. Общими остаются только нейтральная безопасная модель документа, компактный Word-рендерер, OOXML-валидация и атомарная публикация.
